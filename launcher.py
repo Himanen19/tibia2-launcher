@@ -142,9 +142,10 @@ SIDEBAR_CX = W - 44
 SIDEBAR_Y0, SIDEBAR_STEP, SIDEBAR_R = 62, 84, 20
 SOCIAL_ORDER = [("discord", "Discord"), ("instagram", "Instagram"),
                 ("site", "Site"), ("youtube", "Youtube"), ("coins", "T2 Coins")]
-PROG = (210, H - 62, 448, 20)            # trilho: x, y, w, h (encurtado p/ nao passar sob o botao)
-# Feedback (%, contagem, MB/s, tempo) numa linha CENTRALIZADA logo abaixo da barra.
-STATUS_XY = (210 + 448 // 2, H - 34)
+PROG = (210, H - 64, 448, 28)            # trilho mais alto p/ caber o % GRANDE dentro
+# Detalhes (contagem, MB/s, tempo) numa linha CENTRALIZADA logo abaixo da barra;
+# o % fica GRANDE dentro da propria barra.
+STATUS_XY = (210 + 448 // 2, H - 30)
 PLAY = (W - 236, H - 78, 206, 56)        # botao: x, y, w, h
 CLOSE_C = (W - 32, 25, 11)               # cx, cy, r
 MIN_C = (W - 62, 25, 11)
@@ -243,8 +244,27 @@ class Launcher:
         px, py, pw, ph = PROG
         self.prog_fill = self.canvas.create_rectangle(px + 2, py + 2, px + 2, py + ph - 2,
                                                        fill=GOLDL_HEX, outline="")
+        # % GRANDE dentro da barra. Contorno claro (copias deslocadas) + nucleo
+        # escuro: le sobre o dourado (nucleo escuro) E sobre o trilho escuro
+        # (contorno claro). O nucleo (0,0) entra por ultimo p/ ficar por cima.
+        # Fonte com DIGITOS: a Martel do tema e um subset sem numeros/"%", entao o
+        # % e os detalhes (que sao numericos) usam Segoe UI.
+        NUMF = "Segoe UI"
+        cx, cy = px + pw // 2, py + ph // 2
+        self.pct_items = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if (dx, dy) != (0, 0):        # contorno escuro (8 vizinhos)
+                    self.pct_items.append(
+                        self.canvas.create_text(cx + dx, cy + dy, text="",
+                                                fill="#120c06", font=(NUMF, 15, "bold")))
+        # nucleo claro por cima: le sobre o trilho escuro; o contorno escuro dá
+        # contraste quando o % fica sobre o dourado.
+        self.pct_items.append(
+            self.canvas.create_text(cx, cy, text="", fill="#fff4d8",
+                                    font=(NUMF, 15, "bold")))
         self.status = self.canvas.create_text(*STATUS_XY, text="Verificando arquivos...",
-                                              anchor="n", fill=TEXT_HEX, font=(FONT_FAMILY, 11, "bold"))
+                                              anchor="n", fill=TEXT_HEX, font=(NUMF, 10, "bold"))
         bx, by, bw, bh = PLAY
         self.play_txt = self.canvas.create_text(bx + bw // 2, by + bh // 2, text="ABRIR JOGO",
                                                 fill=DIM_HEX, font=(FONT_FAMILY, 15, "bold"))
@@ -524,11 +544,10 @@ class Launcher:
                     self._set_progress(val)
                 elif kind == "dlstat":
                     dn, n_, spd, eta = val
-                    pc = int(100 * dn / n_) if n_ else 0
                     self.canvas.itemconfig(
                         self.status,
-                        text="%d%%     ·     %d/%d     ·     %.1f MB/s     ·     %s"
-                             % (pc, dn, n_, spd, self._fmt_eta(eta)))
+                        text="%d/%d       ·       %.1f MB/s       ·       %s"
+                             % (dn, n_, spd, self._fmt_eta(eta)))
                 elif kind == "news":
                     self._show_news(val)
                 elif kind == "ready":
@@ -543,6 +562,11 @@ class Launcher:
         px, py, pw, ph = PROG
         x = px + 2 + int((pw - 4) * max(0, min(100, pct)) / 100.0)
         self.canvas.coords(self.prog_fill, px + 2, py + 2, x, py + ph - 2)
+        self._set_pct("%d%%" % int(pct))
+
+    def _set_pct(self, text):
+        for it in self.pct_items:
+            self.canvas.itemconfig(it, text=text)
 
     @staticmethod
     def _fmt_eta(s):
