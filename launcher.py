@@ -148,7 +148,7 @@ SOCIAL_ORDER = [("discord", "Discord"), ("instagram", "Instagram"),
 PROG = (210, H - 64, 448, 28)            # trilho mais alto p/ caber o % GRANDE dentro
 # Detalhes (contagem, MB/s, tempo) numa linha CENTRALIZADA logo abaixo da barra;
 # o % fica GRANDE dentro da propria barra.
-STATUS_XY = (210 + 448 // 2, H - 30)
+STATUS_XY = (210 + 448 // 2, H - 20)
 PLAY = (W - 236, H - 78, 206, 56)        # botao: x, y, w, h
 CLOSE_C = (W - 32, 25, 11)               # cx, cy, r
 MIN_C = (W - 62, 25, 11)
@@ -243,10 +243,13 @@ class Launcher:
         self.bg = ImageTk.PhotoImage(build_static_bg())
         self.canvas.create_image(0, 0, anchor="nw", image=self.bg)
 
-        # barra de progresso (preenchimento)
+        # barra de progresso: o preenchimento e uma imagem PIL em PILULA
+        # arredondada, pra casar com os cantos redondos do trilho. (Um retangulo
+        # de canvas tem cantos retos e "vaza" o trilho arredondado.) Redesenhada
+        # a cada progresso em _set_progress.
         px, py, pw, ph = PROG
-        self.prog_fill = self.canvas.create_rectangle(px + 2, py + 2, px + 2, py + ph - 2,
-                                                       fill=GOLDL_HEX, outline="")
+        self._fill_img = None
+        self.fill_item = self.canvas.create_image(px + 2, py + 2, anchor="nw")
         # % GRANDE dentro da barra. Contorno claro (copias deslocadas) + nucleo
         # escuro: le sobre o dourado (nucleo escuro) E sobre o trilho escuro
         # (contorno claro). O nucleo (0,0) entra por ultimo p/ ficar por cima.
@@ -409,14 +412,16 @@ class Launcher:
             if c and c[0] == st.st_size and c[1] == st.st_mtime_ns and c[2] == want:
                 continue
             to_hash.append((rel, want))
-            if i % 1000 == 0:
-                self.q.put(("progress", 100.0 * i / total))
+            # A passada de stat e rapida (~1-2s); nao move a barra pra nao zipar
+            # ate 100 e reiniciar quando o hash comecar.
 
         # 2) Hash SO do que o cache nao cobriu, em PARALELO (sobrepoe o custo por
         #    arquivo). Quem passa vira entrada de cache; quem falha, vai baixar.
+        #    Mesmo feedback do download: % na barra + contagem + tempo estimado.
         if to_hash:
-            self.q.put(("status", "Conferindo %d arquivos..." % len(to_hash)))
-            hp = {"n": 0}
+            nh = len(to_hash)
+            vf = {"n": 0}
+            tv = time.time()
 
             def confere(item):
                 rel, want = item
@@ -432,17 +437,20 @@ class Launcher:
                     with clock:
                         to_update.append((rel, want))
                 with clock:
-                    hp["n"] += 1
-                    k = hp["n"]
-                if k % 200 == 0:
-                    self.q.put(("progress", 100.0 * k / len(to_hash)))
+                    vf["n"] += 1
+                    k = vf["n"]
+                if k % 15 == 0 or k == nh:
+                    self.q.put(("progress", 100.0 * k / nh))
+                    el = max(0.001, time.time() - tv)
+                    eta = (el / k) * (nh - k) if k else 0
+                    self.q.put(("vfstat", (k, nh, eta)))
 
             with ThreadPoolExecutor(max_workers=8) as ex:
                 list(ex.map(confere, to_hash))
 
         if not to_update:
             self._save_cache(cache)
-            self.q.put(("progress", 100)); self.q.put(("status", "Cliente atualizado. Boa cacada!"))
+            self.q.put(("progress", 100)); self.q.put(("status", "Cliente atualizado. Boa caçada!"))
             self.q.put(("ready", "ABRIR JOGO")); return
 
         # Download PARALELO: primeiro install sao 20k+ arquivos; sequencial seria
@@ -488,7 +496,7 @@ class Launcher:
             self.q.put(("status", "Falha ao baixar %s" % state["err"]))
             self.q.put(("ready", "TENTAR DE NOVO")); return
         self._save_cache(cache)
-        self.q.put(("progress", 100)); self.q.put(("status", "Cliente pronto. Boa cacada!"))
+        self.q.put(("progress", 100)); self.q.put(("status", "Cliente pronto. Boa caçada!"))
         self.q.put(("ready", "ABRIR JOGO"))
 
     def _download_one(self, base, rel):
@@ -560,6 +568,12 @@ class Launcher:
                         self.status,
                         text="%d/%d       ·       %.1f MB/s       ·       %s"
                              % (dn, n_, spd, self._fmt_eta(eta)))
+                elif kind == "vfstat":
+                    k, nh, eta = val
+                    self.canvas.itemconfig(
+                        self.status,
+                        text="Conferindo  %d/%d       ·       %s"
+                             % (k, nh, self._fmt_eta(eta)))
                 elif kind == "news":
                     self._show_news(val)
                 elif kind == "ready":
@@ -572,8 +586,14 @@ class Launcher:
 
     def _set_progress(self, pct):
         px, py, pw, ph = PROG
-        x = px + 2 + int((pw - 4) * max(0, min(100, pct)) / 100.0)
-        self.canvas.coords(self.prog_fill, px + 2, py + 2, x, py + ph - 2)
+        w, h = pw - 4, ph - 4
+        fw = int(w * max(0, min(100, pct)) / 100.0)
+        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        if fw >= 2:
+            ImageDraw.Draw(img).rounded_rectangle([0, 0, fw - 1, h - 1],
+                                                  radius=(h - 1) // 2, fill=GOLDL)
+        self._fill_img = ImageTk.PhotoImage(img)
+        self.canvas.itemconfig(self.fill_item, image=self._fill_img)
         self._set_pct("%d%%" % int(pct))
 
     def _set_pct(self, text):
