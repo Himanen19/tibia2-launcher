@@ -26,10 +26,16 @@ import ctypes
 import threading
 import subprocess
 import webbrowser
+import http.client
 import urllib.request
 import urllib.parse
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
+
+# Uma conexao HTTPS persistente POR THREAD (keep-alive). Sem isto, cada arquivo
+# abria um TCP+TLS novo - com 20k arquivos ate Sao Paulo, o handshake dominava
+# (medido: ~18x mais lento que reusar a conexao).
+_conns = threading.local()
 
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
@@ -393,14 +399,37 @@ class Launcher:
         self.q.put(("ready", "ABRIR JOGO"))
 
     def _download_one(self, base, rel):
-        url = base.rstrip("/") + "/" + urllib.parse.quote(rel.lstrip("/"))
+        pr = urllib.parse.urlparse(base)
+        path = pr.path.rstrip("/") + "/" + urllib.parse.quote(rel.lstrip("/"))
         local = rel_to_local(self.root, rel)
         os.makedirs(os.path.dirname(local), exist_ok=True)
         tmp = local + ".part"
-        with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT) as r, open(tmp, "wb") as f:
-            for chunk in iter(lambda: r.read(1 << 20), b""):
-                f.write(chunk)
-        os.replace(tmp, local)
+        # Conexao persistente por thread + 1 reconexao. O Apache fecha a conexao a
+        # cada ~100 requisicoes (MaxKeepAliveRequests); quando isso acontece a
+        # proxima request falha, entao reabrimos e tentamos de novo.
+        for tentativa in (1, 2):
+            conn = getattr(_conns, "c", None)
+            if conn is None:
+                conn = _conns.c = http.client.HTTPSConnection(pr.netloc, timeout=HTTP_TIMEOUT)
+            try:
+                conn.request("GET", path)
+                r = conn.getresponse()
+                if r.status != 200:
+                    r.read()
+                    raise IOError("HTTP %d em %s" % (r.status, rel))
+                with open(tmp, "wb") as f:
+                    for chunk in iter(lambda: r.read(1 << 20), b""):
+                        f.write(chunk)
+                os.replace(tmp, local)
+                return
+            except (http.client.HTTPException, OSError):
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                _conns.c = None
+                if tentativa == 2:
+                    raise
 
     # ---- ponte thread -> UI --------------------------------------------
     def _drain(self):
