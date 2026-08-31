@@ -20,6 +20,7 @@ import os
 import io
 import sys
 import json
+import time
 import zlib
 import queue
 import ctypes
@@ -141,9 +142,9 @@ SIDEBAR_CX = W - 44
 SIDEBAR_Y0, SIDEBAR_STEP, SIDEBAR_R = 62, 84, 20
 SOCIAL_ORDER = [("discord", "Discord"), ("instagram", "Instagram"),
                 ("site", "Site"), ("youtube", "Youtube"), ("coins", "T2 Coins")]
-PROG = (210, H - 58, 448, 22)            # trilho: x, y, w, h (encurtado p/ nao passar sob o botao)
-STATUS_XY = (210, H - 80)
-PCT_XY = (210 + 448 + 10, H - 57)        # "100%" logo apos a barra, antes do botao
+PROG = (210, H - 62, 448, 20)            # trilho: x, y, w, h (encurtado p/ nao passar sob o botao)
+# Feedback (%, contagem, MB/s, tempo) numa linha CENTRALIZADA logo abaixo da barra.
+STATUS_XY = (210 + 448 // 2, H - 34)
 PLAY = (W - 236, H - 78, 206, 56)        # botao: x, y, w, h
 CLOSE_C = (W - 32, 25, 11)               # cx, cy, r
 MIN_C = (W - 62, 25, 11)
@@ -242,10 +243,8 @@ class Launcher:
         px, py, pw, ph = PROG
         self.prog_fill = self.canvas.create_rectangle(px + 2, py + 2, px + 2, py + ph - 2,
                                                        fill=GOLDL_HEX, outline="")
-        self.pct = self.canvas.create_text(*PCT_XY, text="", anchor="w",
-                                           fill=GOLDL_HEX, font=(FONT_FAMILY, 12, "bold"))
         self.status = self.canvas.create_text(*STATUS_XY, text="Verificando arquivos...",
-                                              anchor="w", fill=TEXT_HEX, font=(FONT_FAMILY, 11))
+                                              anchor="n", fill=TEXT_HEX, font=(FONT_FAMILY, 11, "bold"))
         bx, by, bw, bh = PLAY
         self.play_txt = self.canvas.create_text(bx + bw // 2, by + bh // 2, text="ABRIR JOGO",
                                                 fill=DIM_HEX, font=(FONT_FAMILY, 15, "bold"))
@@ -418,25 +417,36 @@ class Launcher:
         # lento demais (latencia por requisicao). 8 ao mesmo tempo esconde isso.
         # Cada arquivo baixado ja entra no cache (sem rehash na proxima abertura).
         n = len(to_update)
-        state = {"done": 0, "err": None}
+        state = {"done": 0, "err": None, "bytes": 0}
+        t0 = time.time()
 
         def baixa(item):
             rel, want = item
             if state["err"]:
                 return
+            sz = 0
             try:
                 self._download_one(base, rel)
                 st = os.stat(rel_to_local(self.root, rel))
+                sz = st.st_size
                 with clock:
                     cache[rel] = [st.st_size, st.st_mtime_ns, want]
             except Exception:
                 state["err"] = rel.lstrip('/')
             with clock:
                 state["done"] += 1
-                dn = state["done"]
+                state["bytes"] += sz
+                dn = state["done"]; by = state["bytes"]
             self.q.put(("progress", 100.0 * dn / n))
-            if dn % 25 == 0 or dn == n:
-                self.q.put(("status", "Baixando arquivos... %d/%d" % (dn, n)))
+            # velocidade + tempo estimado: media movel simples desde o inicio.
+            # ETA por contagem de arquivos (o manifesto nao traz tamanho); com
+            # download paralelo a taxa de arquivos/s e estavel, entao a estimativa
+            # converge rapido.
+            if dn % 15 == 0 or dn == n:
+                el = max(0.001, time.time() - t0)
+                spd = by / el / 1e6                          # MB/s
+                eta = (el / dn) * (n - dn) if dn else 0      # segundos restantes
+                self.q.put(("dlstat", (dn, n, spd, eta)))
 
         with ThreadPoolExecutor(max_workers=8) as ex:
             list(ex.map(baixa, to_update))
@@ -512,12 +522,18 @@ class Launcher:
                     self.canvas.itemconfig(self.status, text=val)
                 elif kind == "progress":
                     self._set_progress(val)
+                elif kind == "dlstat":
+                    dn, n_, spd, eta = val
+                    pc = int(100 * dn / n_) if n_ else 0
+                    self.canvas.itemconfig(
+                        self.status,
+                        text="%d%%     ·     %d/%d     ·     %.1f MB/s     ·     %s"
+                             % (pc, dn, n_, spd, self._fmt_eta(eta)))
                 elif kind == "news":
                     self._show_news(val)
                 elif kind == "ready":
                     self.ready = True
                     self._set_progress(100)
-                    self.canvas.itemconfig(self.pct, text="100%")
                     self.canvas.itemconfig(self.play_txt, fill=GOLDL_HEX, text=val)
         except queue.Empty:
             pass
@@ -527,7 +543,14 @@ class Launcher:
         px, py, pw, ph = PROG
         x = px + 2 + int((pw - 4) * max(0, min(100, pct)) / 100.0)
         self.canvas.coords(self.prog_fill, px + 2, py + 2, x, py + ph - 2)
-        self.canvas.itemconfig(self.pct, text="%d%%" % int(pct))
+
+    @staticmethod
+    def _fmt_eta(s):
+        if s >= 90:
+            return "faltam ~%d min" % round(s / 60.0)
+        if s >= 3:
+            return "faltam ~%ds" % int(s)
+        return "quase la"
 
     def _show_news(self, lista):
         self.news.configure(state="normal")
