@@ -357,22 +357,68 @@ class Launcher:
 
         base = manifest.get("url") or ""
         files = manifest.get("files") or {}
-        self.q.put(("status", "Validando arquivos (%d)..." % len(files)))
-        to_update, total = [], max(1, len(files))
+        cache = self._load_cache()          # {rel: [tamanho, mtime_ns, crc]} da ultima vez
+        clock = threading.Lock()
+        self.q.put(("status", "Verificando arquivos (%d)..." % len(files)))
+
+        # 1) Passada rapida: so um stat por arquivo. Se tamanho+mtime batem com o
+        #    cache e o crc guardado e o do manifesto, o arquivo esta OK sem reler
+        #    os bytes. So entra na fila de HASH quem o cache nao cobre; quem falta
+        #    vai direto pra baixar. Isso derruba a reverificacao de ~164s (reler
+        #    943 MB) para um stat de cada arquivo (~1-2s) quando nada mudou.
+        to_update, to_hash = [], []
+        total = max(1, len(files))
         for i, (rel, want) in enumerate(files.items()):
-            if crc32_of(rel_to_local(self.root, rel)) != want:
-                to_update.append((rel, want))
-            if i % 200 == 0:
+            local = rel_to_local(self.root, rel)
+            try:
+                st = os.stat(local)
+            except OSError:
+                to_update.append((rel, want)); continue
+            c = cache.get(rel)
+            if c and c[0] == st.st_size and c[1] == st.st_mtime_ns and c[2] == want:
+                continue
+            to_hash.append((rel, want))
+            if i % 1000 == 0:
                 self.q.put(("progress", 100.0 * i / total))
+
+        # 2) Hash SO do que o cache nao cobriu, em PARALELO (sobrepoe o custo por
+        #    arquivo). Quem passa vira entrada de cache; quem falha, vai baixar.
+        if to_hash:
+            self.q.put(("status", "Conferindo %d arquivos..." % len(to_hash)))
+            hp = {"n": 0}
+
+            def confere(item):
+                rel, want = item
+                local = rel_to_local(self.root, rel)
+                if crc32_of(local) == want:
+                    try:
+                        st = os.stat(local)
+                        with clock:
+                            cache[rel] = [st.st_size, st.st_mtime_ns, want]
+                    except OSError:
+                        pass
+                else:
+                    with clock:
+                        to_update.append((rel, want))
+                with clock:
+                    hp["n"] += 1
+                    k = hp["n"]
+                if k % 200 == 0:
+                    self.q.put(("progress", 100.0 * k / len(to_hash)))
+
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                list(ex.map(confere, to_hash))
+
         if not to_update:
+            self._save_cache(cache)
             self.q.put(("progress", 100)); self.q.put(("status", "Cliente atualizado. Boa cacada!"))
             self.q.put(("ready", "ABRIR JOGO")); return
 
         # Download PARALELO: primeiro install sao 20k+ arquivos; sequencial seria
         # lento demais (latencia por requisicao). 8 ao mesmo tempo esconde isso.
+        # Cada arquivo baixado ja entra no cache (sem rehash na proxima abertura).
         n = len(to_update)
         state = {"done": 0, "err": None}
-        lock = threading.Lock()
 
         def baixa(item):
             rel, want = item
@@ -380,9 +426,12 @@ class Launcher:
                 return
             try:
                 self._download_one(base, rel)
+                st = os.stat(rel_to_local(self.root, rel))
+                with clock:
+                    cache[rel] = [st.st_size, st.st_mtime_ns, want]
             except Exception:
                 state["err"] = rel.lstrip('/')
-            with lock:
+            with clock:
                 state["done"] += 1
                 dn = state["done"]
             self.q.put(("progress", 100.0 * dn / n))
@@ -393,8 +442,10 @@ class Launcher:
             list(ex.map(baixa, to_update))
 
         if state["err"]:
+            self._save_cache(cache)
             self.q.put(("status", "Falha ao baixar %s" % state["err"]))
             self.q.put(("ready", "TENTAR DE NOVO")); return
+        self._save_cache(cache)
         self.q.put(("progress", 100)); self.q.put(("status", "Cliente pronto. Boa cacada!"))
         self.q.put(("ready", "ABRIR JOGO"))
 
@@ -430,6 +481,27 @@ class Launcher:
                 _conns.c = None
                 if tentativa == 2:
                     raise
+
+    # ---- cache de integridade (pula rehash de arquivo inalterado) -------
+    def _cache_file(self):
+        return os.path.join(self.root, ".tibia2_cache.json")
+
+    def _load_cache(self):
+        try:
+            with open(self._cache_file(), "r", encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_cache(self, cache):
+        try:
+            tmp = self._cache_file() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cache, f)
+            os.replace(tmp, self._cache_file())
+        except Exception:
+            pass
 
     # ---- ponte thread -> UI --------------------------------------------
     def _drain(self):
