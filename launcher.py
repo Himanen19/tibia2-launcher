@@ -38,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 # (medido: ~18x mais lento que reusar a conexao).
 _conns = threading.local()
 
-from PIL import Image, ImageDraw, ImageFont, ImageTk
+from PIL import Image, ImageDraw, ImageFont, ImageTk, ImageFilter
 
 # ---------------------------------------------------------------------------
 # Config. Producao por padrao; para testar local use as envs (test-local.bat).
@@ -153,6 +153,67 @@ PLAY = (W - 236, H - 78, 206, 56)        # botao: x, y, w, h
 CLOSE_C = (W - 32, 25, 11)               # cx, cy, r
 MIN_C = (W - 62, 25, 11)
 
+# Sombra do drop-shadow do botao (padding em volta pra caber o blur).
+BTN_PAD = 9
+
+
+def _vgrad3(w, h, stops):
+    """Gradiente vertical com 3 paradas (pos 0..1, cor). Igual aos linear-gradient
+    dourado/azul do .t2-btn-cta do site."""
+    img = Image.new("RGB", (max(1, w), max(1, h)))
+    d = ImageDraw.Draw(img)
+    for y in range(h):
+        t = (y / (h - 1)) if h > 1 else 0.0
+        c = stops[-1][1]
+        for i in range(len(stops) - 1):
+            p0, c0 = stops[i]
+            p1, c1 = stops[i + 1]
+            if t <= p1 or i == len(stops) - 2:
+                tt = 0.0 if p1 <= p0 else max(0.0, min(1.0, (t - p0) / (p1 - p0)))
+                c = tuple(int(c0[j] + (c1[j] - c0[j]) * tt) for j in range(3))
+                break
+        d.line([(0, y), (w, y)], fill=c)
+    return img
+
+
+def cta_button(w, h, ch=9):
+    """Botao no estilo .t2-btn-cta do site: cantos chanfrados (octogono), aresta
+    DOURADA por fora -> PRETO -> miolo AZUL com brilho no topo, + drop-shadow.
+    Retorna uma imagem RGBA de (w+2*BTN_PAD) x (h+2*BTN_PAD); componha em
+    (bx-BTN_PAD, by-BTN_PAD)."""
+    p = BTN_PAD
+    W2, H2 = w + 2 * p, h + 2 * p
+    out = Image.new("RGBA", (W2, H2), (0, 0, 0, 0))
+
+    def octa(x0, y0, x1, y1):
+        return [(x0 + ch, y0), (x1 - ch, y0), (x1, y0 + ch), (x1, y1 - ch),
+                (x1 - ch, y1), (x0 + ch, y1), (x0, y1 - ch), (x0, y0 + ch)]
+
+    def layer(grad_img, inset):
+        m = Image.new("L", (W2, H2), 0)
+        ImageDraw.Draw(m).polygon(
+            octa(p + inset, p + inset, p + w - inset, p + h - inset), fill=255)
+        lay = Image.new("RGBA", (W2, H2), (0, 0, 0, 0))
+        lay.paste(grad_img, (p + inset, p + inset))
+        out.paste(lay, (0, 0), m)
+
+    # drop-shadow
+    sh = Image.new("RGBA", (W2, H2), (0, 0, 0, 0))
+    ImageDraw.Draw(sh).polygon(octa(p, p + 3, p + w, p + h + 3), fill=(0, 0, 0, 170))
+    out.alpha_composite(sh.filter(ImageFilter.GaussianBlur(5)))
+
+    # dourado (aresta externa)
+    layer(_vgrad3(w, h, [(0.0, (255, 217, 106)), (0.42, (232, 184, 62)), (1.0, (169, 130, 42))]), 0)
+    # preto, recuado 2px (separa o ouro do azul)
+    mb = Image.new("L", (W2, H2), 0)
+    ImageDraw.Draw(mb).polygon(octa(p + 2, p + 2, p + w - 2, p + h - 2), fill=255)
+    out.paste((1, 4, 7, 255), (0, 0), mb)
+    # miolo azul, recuado 4px, com brilho no topo
+    blue = _vgrad3(w - 8, h - 8, [(0.0, (58, 130, 190)), (0.44, (22, 76, 130)), (1.0, (11, 43, 77))])
+    ImageDraw.Draw(blue).line([(0, 0), (w - 8, 0)], fill=(210, 228, 245))
+    layer(blue, 4)
+    return out
+
 
 def build_static_bg():
     img = Image.new("RGBA", (W, H), GROUND + (255,))
@@ -209,9 +270,11 @@ def build_static_bg():
     px, py, pw, ph = PROG
     d.rounded_rectangle([px, py, px + pw, py + ph], radius=ph // 2, fill=(10, 18, 28), outline=GOLDD, width=1)
 
-    # moldura do botao ABRIR JOGO (texto e canvas, pra mudar de cor)
+    # botao ABRIR JOGO no estilo do site (.t2-btn-cta): octogono chanfrado,
+    # aresta dourada + preto + miolo azul. O texto e canvas (creme quando pronto,
+    # apagado durante o download).
     bx, by, bw, bh = PLAY
-    d.rounded_rectangle([bx, by, bx + bw, by + bh], radius=bh // 2, fill=(14, 22, 34), outline=GOLD, width=3)
+    img.alpha_composite(cta_button(bw, bh), (bx - BTN_PAD, by - BTN_PAD))
 
     return img
 
@@ -579,7 +642,7 @@ class Launcher:
                 elif kind == "ready":
                     self.ready = True
                     self._set_progress(100)
-                    self.canvas.itemconfig(self.play_txt, fill=GOLDL_HEX, text=val)
+                    self.canvas.itemconfig(self.play_txt, fill="#fff6dc", text=val)
         except queue.Empty:
             pass
         self.tk.after(80, self._drain)
