@@ -25,7 +25,15 @@ jobs:
           --name "Tibia 2" --icon "assets/shield.ico"
           --add-data "assets;assets" launcher.py
 
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+
       # --- Assinatura de código (SignPath) -------------------------------------
+      # Quando ligar: assine dist/Tibia 2.exe ANTES do passo do instalador (para o
+      # launcher instalado ficar assinado) e assine tambem o dist/Tibia 2 Setup.exe.
       # Descomente quando o projeto for aprovado no SignPath Foundation
       # (https://about.signpath.io/product/open-source). O passo pega o
       # "dist/Tibia 2.exe", envia para assinatura e devolve o mesmo caminho
@@ -48,11 +56,15 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Tibia2-launcher
-          path: dist/Tibia 2.exe
+          path: |
+            dist/Tibia 2.exe
+            dist/Tibia 2 Setup.exe
           if-no-files-found: error
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/Tibia 2.exe
+          files: |
+            dist/Tibia 2.exe
+            dist/Tibia 2 Setup.exe
