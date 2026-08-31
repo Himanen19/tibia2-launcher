@@ -46,6 +46,9 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 # ---------------------------------------------------------------------------
 UPDATER_URL = os.environ.get("PANGEIA_UPDATER_URL", "https://tibia2ot.com/updater.php")
 NEWS_URL = os.environ.get("PANGEIA_NEWS_URL", "https://tibia2ot.com/noticias.php")
+# Info do proprio launcher (crc + url do exe) para o auto-update.
+LAUNCHER_INFO_URL = os.environ.get("PANGEIA_LAUNCHER_INFO",
+                                   "https://tibia2ot.com/templates/tibia2/launcher.json")
 CLIENT_EXE = "otclient.exe"
 HTTP_TIMEOUT = 30
 LINKS = {
@@ -354,6 +357,15 @@ class Launcher:
 
     # ---- worker (thread) ------------------------------------------------
     def _work(self):
+        # Auto-update do PROPRIO launcher, antes de tudo. Se trocar, relanca e sai.
+        self.q.put(("status", "Verificando launcher..."))
+        try:
+            if self_update():
+                self.q.put(("status", "Atualizando launcher..."))
+                os._exit(0)
+        except Exception:
+            pass
+
         try:
             data = http_get_json(NEWS_URL)
             self.q.put(("news", data.get("noticias", []) if isinstance(data, dict) else []))
@@ -614,6 +626,83 @@ class Launcher:
 
 
 _mutex_handle = None
+
+
+def release_mutex():
+    """Libera o mutex de instancia unica (usado antes de relancar no auto-update,
+    senao a nova instancia acha o mutex e sai achando que ja tem outra aberta)."""
+    global _mutex_handle
+    try:
+        if _mutex_handle:
+            ctypes.windll.kernel32.CloseHandle(_mutex_handle)
+    except Exception:
+        pass
+    _mutex_handle = None
+
+
+def self_update():
+    """Se o proprio Tibia 2.exe estiver desatualizado (crc != o do servidor em
+    launcher.json), baixa o novo, troca e relanca. Retorna True se relancou (o
+    chamador deve sair). Nao da pra sobrescrever um exe em uso, entao usamos o
+    'rename dance': renomeia o exe em execucao (permitido no Windows) e poe o novo
+    no lugar. Tolerante a falha: qualquer erro -> segue com a versao atual."""
+    if not getattr(sys, "frozen", False):
+        return False
+    exe = sys.executable
+    d = os.path.dirname(exe)
+    old = os.path.join(d, "Tibia 2.old.exe")
+    new = os.path.join(d, "Tibia 2.new.exe")
+    for junk in (old, new):                    # limpa sobras de update anterior
+        try:
+            if os.path.exists(junk):
+                os.remove(junk)
+        except OSError:
+            pass
+    try:
+        info = http_get_json(LAUNCHER_INFO_URL)
+        want = (info or {}).get("crc")
+        url = (info or {}).get("url")
+    except Exception:
+        return False
+    if not want or not url or crc32_of(exe) == want:
+        return False                           # sem info ou ja atualizado
+    try:
+        with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT) as r, open(new, "wb") as f:
+            for chunk in iter(lambda: r.read(1 << 20), b""):
+                f.write(chunk)
+    except Exception:
+        try:
+            os.remove(new)
+        except OSError:
+            pass
+        return False
+    if crc32_of(new) != want:                  # download corrompido -> ignora
+        try:
+            os.remove(new)
+        except OSError:
+            pass
+        return False
+    try:
+        os.rename(exe, old)                     # renomear exe EM USO: ok no Windows
+        os.rename(new, exe)
+    except OSError:
+        try:                                    # desfaz se der ruim no meio
+            if not os.path.exists(exe) and os.path.exists(old):
+                os.rename(old, exe)
+        except OSError:
+            pass
+        try:
+            if os.path.exists(new):
+                os.remove(new)
+        except OSError:
+            pass
+        return False
+    release_mutex()                             # libera antes de relancar
+    try:
+        subprocess.Popen([exe], cwd=d, env=os.environ.copy())
+    except Exception:
+        return False
+    return True
 
 
 def single_instance_or_focus():

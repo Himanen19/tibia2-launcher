@@ -25,6 +25,17 @@ jobs:
           --name "Tibia 2" --icon "assets/shield.ico"
           --add-data "assets;assets" launcher.py
 
+      # launcher.json: crc do exe (formato do launcher: hex, sem zeros a esquerda)
+      # para o auto-update. Quando ligar a assinatura, gere ISTO DEPOIS de assinar
+      # o exe (o crc tem que ser o do exe realmente distribuido).
+      - name: Launcher version (launcher.json)
+        shell: pwsh
+        run: |
+          $crc = python -c "import zlib; print(format(zlib.crc32(open(r'dist/Tibia 2.exe','rb').read()) & 0xffffffff, 'x'))"
+          $json = '{"crc":"' + $crc.Trim() + '","url":"https://tibia2ot.com/templates/tibia2/Tibia%202.exe"}'
+          Set-Content -Path 'dist/launcher.json' -Value $json -NoNewline
+          Get-Content 'dist/launcher.json'
+
       - name: Build installer (Inno Setup)
         shell: pwsh
         run: |
@@ -59,6 +70,7 @@ jobs:
           path: |
             dist/Tibia 2.exe
             dist/Tibia 2 Setup.exe
+            dist/launcher.json
           if-no-files-found: error
 
       - name: Attach to release
@@ -68,3 +80,4 @@ jobs:
           files: |
             dist/Tibia 2.exe
             dist/Tibia 2 Setup.exe
+            dist/launcher.json
