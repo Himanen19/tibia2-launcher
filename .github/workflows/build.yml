@@ -1,0 +1,58 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Build exe
+        run: >
+          pyinstaller --onefile --noconsole --clean --noconfirm
+          --name "Tibia 2" --icon "assets/shield.ico"
+          --add-data "assets;assets" launcher.py
+
+      # --- Assinatura de código (SignPath) -------------------------------------
+      # Descomente quando o projeto for aprovado no SignPath Foundation
+      # (https://about.signpath.io/product/open-source). O passo pega o
+      # "dist/Tibia 2.exe", envia para assinatura e devolve o mesmo caminho
+      # assinado. Configure os secrets SIGNPATH_* / SIGNPATH_API_TOKEN no repo.
+      #
+      # - name: Sign with SignPath
+      #   uses: signpath/github-action-submit-signing-request@v1
+      #   with:
+      #     api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+      #     organization-id: ${{ secrets.SIGNPATH_ORG_ID }}
+      #     project-slug: tibia2-launcher
+      #     signing-policy-slug: release-signing
+      #     artifact-configuration-slug: exe
+      #     github-artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      #     wait-for-completion: true
+      #     output-artifact-directory: dist
+
+      - name: Upload artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tibia2-launcher
+          path: dist/Tibia 2.exe
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Tibia 2.exe

@@ -1,0 +1,5 @@
+# Runtime
+pillow>=10.0
+
+# Build
+pyinstaller>=6.0
