@@ -57,7 +57,7 @@ CLIENT_EXE = "Tibia 2 Client.exe"
 # o codigo vive espalhado em _internal\ e nao mais num unico .exe com um CRC. O
 # deploy LE este valor daqui (nunca digita no JSON) - ver deploy-cliente.ps1.
 # BUMP a cada launcher que for publicado, senao o auto-update nao dispara.
-LAUNCHER_VERSION = "2026-09-22"
+LAUNCHER_VERSION = "2026-09-23"
 HTTP_TIMEOUT = 30
 # TODA requisicao do launcher tem de mandar este User-Agent.
 #
@@ -1759,21 +1759,31 @@ def release_mutex():
 
 
 # ---------------------------------------------------------------------------
-# SWAPPER DO AUTO-UPDATE (onedir)
+# SWAPPER DO AUTO-UPDATE (onedir) - versao ROBUSTA
 #
 # No onedir o launcher e uma PASTA (Tibia 2.exe + _internal\). Nao da pra
 # sobrescrever _internal\*.dll com o launcher aberto - DLL carregada fica
 # travada. Entao o auto-update baixa a pasta nova, escreve este .bat e SAI; o
-# .bat espera o launcher fechar, troca _internal\ (rename atomico com rollback),
-# copia o exe e reabre. So mexe em _internal\ e no exe - NUNCA nos ~940 MB do
-# cliente, que ficam soltos na mesma pasta.
+# .bat espera o launcher fechar e troca _internal\ + o exe. So mexe nesses dois -
+# NUNCA nos ~940 MB do cliente, que ficam soltos na mesma pasta.
+#
+# POR QUE ROBUSTO (a versao antiga loopava): ela fazia
+# `move "%NEW%\_internal" "_internal"` - rename atomico da pasta RECEM extraida.
+# Se o antivirus estava varrendo uma DLL nova (a openblas do numpy tem ~20 MB), o
+# rename falhava de uma vez, o swap revertia e relancava o exe VELHO, que via de
+# novo "estou velho" e repetia: abre-e-fecha sem fim. Agora, em 3 camadas:
+#   1. STAGE por robocopy /R (REINTENTA cada arquivo travado) -> _internal.stage;
+#   2. COMMIT so entao, por renomeacoes LOCAIS (rapidas, do que ja e nosso), cada
+#      uma com retry e em ordem que deixa sempre um par consistente se falhar;
+#   3. o teto de tentativas TOTAL fica no marcador em self_update (quebra-loop):
+#      apos MAX_UPDATE_ATTEMPTS o launcher desiste e roda a versao atual.
+# Cada passo loga em tibia2-launcher.log - o swap deixou de ser silencioso.
 #
 # Detalhes que tem motivo:
 #   - ping -n em vez de timeout: timeout le do console, e este .bat roda
 #     destacado SEM console (timeout falharia na hora).
-#   - deteccao de fim do move pelo SOURCE ("%NEW%\_internal" sumiu?), e nao por
-#     um arquivo conhecido tipo python313.dll: assim nao quebra quando o Python
-#     mudar de versao.
+#   - a espera pelo fim do launcher tem TETO (~40s): se o processo travar, o
+#     swapper aborta sem mexer, em vez de esperar pra sempre.
 #   - o .bat se AUTO-LOCALIZA por %~dp0 (APP e o pai de _launcher_update\), em vez
 #     de embutir o caminho da instalacao. O caminho passa pelo Desktop do usuario,
 #     que em pt-BR costuma ter acento (C:\Users\Jose...) - embutir isso num .bat
@@ -1782,30 +1792,118 @@ def release_mutex():
 #     pelo proprio cmd.
 # ---------------------------------------------------------------------------
 _SWAPPER_BAT = r"""@echo off
-setlocal enableextensions
+setlocal enableextensions enabledelayedexpansion
 set "EXE=Tibia 2.exe"
 set "UPD=%~dp0"
 for %%I in ("%UPD%..") do set "APP=%%~fI"
 set "NEW=%UPD%new"
+set "LOG=%APP%\tibia2-launcher.log"
 cd /d "%APP%"
+>>"%LOG%" echo %date% %time%  swapper: iniciado
+
+rem 1) Espera o launcher fechar. Teto ~40s (80 x ~0.5s): sem console o timeout
+rem    falha, entao contamos ciclos de ping. Estourou -> aborta sem mexer em nada.
+set /a _w=0
 :waitloop
 tasklist /fi "imagename eq %EXE%" 2>nul | find /i "%EXE%" >nul
-if not errorlevel 1 (
-    ping -n 2 127.0.0.1 >nul
-    goto waitloop
+if errorlevel 1 goto closed
+set /a _w+=1
+if !_w! gtr 80 (
+    >>"%LOG%" echo %date% %time%  swapper: launcher nao fechou em 40s, abortando
+    goto done
 )
-if exist "_internal.old" rmdir /s /q "_internal.old"
-if exist "_internal" ren "_internal" "_internal.old"
-move "%NEW%\_internal" "%APP%\_internal" >nul 2>&1
-if exist "%NEW%\_internal" (
-    if exist "_internal.old" ren "_internal.old" "_internal"
+ping -n 2 127.0.0.1 >nul
+goto waitloop
+:closed
+
+rem 2) STAGE: copia o _internal novo para _internal.stage. robocopy REINTENTA
+rem    arquivo travado (AV varrendo DLL recem-extraida) - a raiz do loop antigo,
+rem    onde o "move" da pasta falhava de uma vez. /R:20 /W:1 = ate 20 tentativas
+rem    por arquivo, 1s entre elas. Exit >=8 = falha real.
+if exist "%APP%\_internal.stage" rmdir /s /q "%APP%\_internal.stage"
+robocopy "%NEW%\_internal" "%APP%\_internal.stage" /E /R:20 /W:1 /NFL /NDL /NJH /NJS /NP >nul
+if %ERRORLEVEL% GEQ 8 (
+    >>"%LOG%" echo %date% %time%  swapper: robocopy stage falhou err=%ERRORLEVEL%
+    if exist "%APP%\_internal.stage" rmdir /s /q "%APP%\_internal.stage"
     goto relaunch
 )
-copy /y "%NEW%\%EXE%" "%APP%\%EXE%" >nul 2>&1
-if exist "_internal.old" rmdir /s /q "_internal.old"
+
+rem 3) Sanity do que vamos instalar.
+if not exist "%NEW%\%EXE%" goto sanity_fail
+if not exist "%APP%\_internal.stage\python313.dll" goto sanity_fail
+
+rem 4) COMMIT: renomeacoes LOCAIS (rapidas, do que ja e nosso), cada uma com
+rem    retry, em ordem que deixa sempre um par (_internal, exe) CONSISTENTE se
+rem    algo falhar no meio - ver os rollbacks nos labels commit_fail_*.
+if exist "%APP%\_internal.old" rmdir /s /q "%APP%\_internal.old"
+call :ren_retry "_internal" "_internal.old"
+if errorlevel 1 goto commit_fail_a
+call :ren_retry "_internal.stage" "_internal"
+if errorlevel 1 goto commit_fail_b
+call :copy_retry "%NEW%\%EXE%" "%APP%\%EXE%"
+if errorlevel 1 goto commit_fail_c
+
+rem 5) Sucesso. Loga e relanca. NAO apaga %UPD% aqui: este .bat roda de DENTRO
+rem    dele - um rmdir do proprio diretorio corta a leitura do batch no meio, e o
+rem    relaunch abaixo nem rodaria (launcher trocaria mas nao reabriria). Quem
+rem    limpa _launcher_update e o self_update na proxima abertura (faxina). So o
+rem    _internal.old, que fica FORA de %UPD%, da pra remover aqui com seguranca.
+>>"%LOG%" echo %date% %time%  swapper: update aplicado com sucesso
+if exist "%APP%\_internal.old" rmdir /s /q "%APP%\_internal.old"
+goto relaunch
+
+:sanity_fail
+>>"%LOG%" echo %date% %time%  swapper: pacote novo incompleto, abortando
+if exist "%APP%\_internal.stage" rmdir /s /q "%APP%\_internal.stage"
+goto relaunch
+
+:commit_fail_a
+rem nao tirou o _internal velho do caminho: nada mudou, versao atual intacta.
+>>"%LOG%" echo %date% %time%  swapper: _internal travado, mantendo versao atual
+if exist "%APP%\_internal.stage" rmdir /s /q "%APP%\_internal.stage"
+goto relaunch
+
+:commit_fail_b
+rem _internal virou _internal.old mas o novo nao entrou: restaura o velho.
+>>"%LOG%" echo %date% %time%  swapper: novo _internal nao entrou, revertendo
+call :ren_retry "_internal.old" "_internal"
+if exist "%APP%\_internal.stage" rmdir /s /q "%APP%\_internal.stage"
+goto relaunch
+
+:commit_fail_c
+rem _internal ja e o novo mas o exe nao trocou: reverte pro par VELHO consistente.
+>>"%LOG%" echo %date% %time%  swapper: exe travado, revertendo o par
+call :ren_retry "_internal" "_internal.stage"
+call :ren_retry "_internal.old" "_internal"
+if exist "%APP%\_internal.stage" rmdir /s /q "%APP%\_internal.stage"
+goto relaunch
+
 :relaunch
 start "" "%APP%\%EXE%"
+:done
 endlocal
+exit /b
+
+:ren_retry
+rem %1=origem %2=destino ; ok = a origem sumiu. Ate 8 tentativas (lock transitorio).
+set /a _r=0
+:ren_loop
+ren %1 %2 >nul 2>&1
+if not exist %1 exit /b 0
+set /a _r+=1
+if !_r! gtr 8 exit /b 1
+ping -n 2 127.0.0.1 >nul
+goto ren_loop
+
+:copy_retry
+set /a _c=0
+:copy_loop
+copy /y %1 %2 >nul 2>&1
+if not errorlevel 1 exit /b 0
+set /a _c+=1
+if !_c! gtr 8 exit /b 1
+ping -n 2 127.0.0.1 >nul
+goto copy_loop
 """
 
 
@@ -1821,6 +1919,40 @@ def _rmtree_quieto(path):
         pass
 
 
+# Quantas vezes tentar TROCAR para a MESMA versao antes de desistir e rodar a
+# atual. O quebra-loop: sem isto, um swap que falha sempre (lock, permissao,
+# disco cheio) faz o exe velho reabrir, ver "estou velho" e repetir pra sempre -
+# o launcher "fecha ao abrir". Com o marcador abaixo, apos N falhas o launcher
+# fica na versao atual (que funciona) ate o servidor publicar uma versao NOVA.
+MAX_UPDATE_ATTEMPTS = 3
+
+
+def _marker_path(app):
+    return os.path.join(app, "_update_pending.json")
+
+
+def _read_marker(app):
+    """(versao-alvo, tentativas) do marcador; ('', 0) se ausente/ilegivel."""
+    try:
+        with open(_marker_path(app), "r", encoding="ascii") as f:
+            d = json.load(f)
+        return str(d.get("target") or ""), int(d.get("attempts") or 0)
+    except Exception:
+        return "", 0
+
+
+def _write_marker(app, target, attempts):
+    try:
+        with open(_marker_path(app), "w", encoding="ascii") as f:
+            json.dump({"target": target, "attempts": attempts}, f)
+    except Exception:
+        pass
+
+
+def _clear_marker(app):
+    _rmtree_quieto(_marker_path(app))
+
+
 def self_update():
     """Se este launcher (onedir) estiver desatualizado (version != a do servidor
     em launcher.json), baixa a PASTA nova (zip), dispara o swapper .bat e sai.
@@ -1833,11 +1965,12 @@ def self_update():
     app = os.path.dirname(exe)
     exe_name = os.path.basename(exe)           # "Tibia 2.exe"
     upd = os.path.join(app, "_launcher_update")
-    # Faxina do update anterior. O swapper roda DEPOIS que saimos, entao a
-    # limpeza da pasta de update e do _internal.old fica pra ca - a proxima
-    # abertura. Roda mesmo quando ja estamos atualizados (nao ha o que baixar).
+    # Faxina de restos do swap anterior (roda sempre, mesmo ja atualizado): a
+    # pasta de update e as pastas de trabalho do swapper (.old/.stage). O swapper
+    # roda DEPOIS que saimos, entao a limpeza fica pra proxima abertura.
     _rmtree_quieto(upd)
     _rmtree_quieto(os.path.join(app, "_internal.old"))
+    _rmtree_quieto(os.path.join(app, "_internal.stage"))
     try:
         info = http_get_json(LAUNCHER_INFO_URL)
     except Exception as e:
@@ -1854,8 +1987,26 @@ def self_update():
     # Com a chave renomeada o onefile antigo ve want=None e nao faz nada (seguro);
     # ele migra pra onedir reinstalando. Ver docs/deploy-online.md.
     want_crc = (info or {}).get("zip_crc")
-    if not remote_ver or not url or remote_ver == LAUNCHER_VERSION:
-        return False                           # sem info ou ja atualizado
+    if not remote_ver or not url:
+        _clear_marker(app)
+        return False                           # servidor sem info de launcher
+    if remote_ver == LAUNCHER_VERSION:
+        # Estamos na versao do servidor: atualizado (ou o swap anterior deu certo).
+        # Zera o marcador de tentativas - o proximo alvo comeca do zero.
+        _clear_marker(app)
+        return False
+    # Desatualizados. QUEBRA-LOOP: se ja tentamos trocar para ESTA versao
+    # MAX_UPDATE_ATTEMPTS vezes e continuamos velhos, o swap esta falhando de forma
+    # persistente. Paramos de tentar e rodamos a versao ATUAL (que abre) - melhor
+    # um launcher velho funcionando que um abre-e-fecha. O marcador so vale para
+    # ESTE alvo; quando o servidor publicar outra versao, tentamos de novo.
+    mtarget, mattempts = _read_marker(app)
+    attempts = mattempts if mtarget == remote_ver else 0
+    if attempts >= MAX_UPDATE_ATTEMPTS:
+        log_erro("auto-update desistiu (quebra-loop)", None,
+                 "alvo %s apos %d tentativas; seguindo na %s"
+                 % (remote_ver, attempts, LAUNCHER_VERSION))
+        return False
     # Baixa o zip da pasta nova.
     try:
         os.makedirs(upd, exist_ok=True)
@@ -1888,6 +2039,10 @@ def self_update():
         log_erro("launcher zip sem exe/_internal", None, newdir)
         _rmtree_quieto(upd)
         return False
+    # Conta ESTA tentativa ANTES de disparar o swapper. Se o swap falhar, a
+    # proxima abertura le attempts+1 e, no teto, aciona o quebra-loop. Se der
+    # certo, a versao nova abre, ve remote_ver == LAUNCHER_VERSION e zera tudo.
+    _write_marker(app, remote_ver, attempts + 1)
     # Escreve o swapper (caminhos baked) e dispara destacado.
     bat = os.path.join(upd, "apply.bat")
     try:
@@ -1899,9 +2054,20 @@ def self_update():
         return False
     release_mutex()                            # libera o mutex antes de relancar
     try:
-        DETACHED, NO_WINDOW = 0x00000008, 0x08000000
-        subprocess.Popen(["cmd", "/c", bat],
-                         creationflags=DETACHED | NO_WINDOW, close_fds=True)
+        # CREATE_NO_WINDOW, e NAO DETACHED_PROCESS. Com DETACHED o cmd fica SEM
+        # console; ai cada console-app que ele chama (tasklist, robocopy, ping)
+        # ALOCA o proprio console -> JANELAS DE CMD PISCANDO na cara do jogador, e
+        # de quebra o `tasklist | find` do waitloop nem retorna direito (o swapper
+        # travava). CREATE_NO_WINDOW da um console OCULTO que os filhos herdam:
+        # nenhuma janela aparece e os console-apps funcionam normalmente. O startupinfo
+        # com SW_HIDE reforca (nada some, nada pisca). O processo sobrevive ao
+        # os._exit do launcher (nao esta preso a nenhum console dele).
+        CREATE_NO_WINDOW = 0x08000000
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0                     # SW_HIDE
+        subprocess.Popen(["cmd", "/c", bat], creationflags=CREATE_NO_WINDOW,
+                         startupinfo=si, close_fds=True)
     except Exception as e:
         log_erro("disparar swapper", e, bat)
         return False
