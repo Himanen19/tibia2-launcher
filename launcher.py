@@ -57,7 +57,7 @@ CLIENT_EXE = "Tibia 2 Client.exe"
 # o codigo vive espalhado em _internal\ e nao mais num unico .exe com um CRC. O
 # deploy LE este valor daqui (nunca digita no JSON) - ver deploy-cliente.ps1.
 # BUMP a cada launcher que for publicado, senao o auto-update nao dispara.
-LAUNCHER_VERSION = "2026-09-23"
+LAUNCHER_VERSION = "2026-09-24"
 HTTP_TIMEOUT = 30
 # TODA requisicao do launcher tem de mandar este User-Agent.
 #
@@ -171,7 +171,7 @@ LINKS = {
     "discord": "https://discord.gg/fd3gS47sFg",
     "instagram": "https://www.instagram.com/tibia2ot/",
     "site": "https://tibia2ot.com/",
-    "youtube": "https://www.youtube.com/@tibia2",
+    "youtube": "https://www.youtube.com/@HimanenTV",
     "coins": "https://tibia2ot.com/loja",  # loja de T2 Coins
 }
 
@@ -1431,7 +1431,7 @@ class Launcher:
             if it:
                 it = it[0]
                 self.track("youtube", it.get("canal") or "?")
-                self._open(it.get("url") or "https://www.youtube.com/@tibia2")
+                self._open(it.get("url") or "https://www.youtube.com/@HimanenTV")
         elif act.startswith("soc:"):
             key = act.split(":")[1]
             if key == "twitch":
