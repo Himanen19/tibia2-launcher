@@ -42,7 +42,22 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
 
 [Files]
-Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+; ATENCAO: a fonte e dist-noupx\Tibia 2\ (PASTA), e NAO dist\.
+;
+; O launcher agora e ONEDIR: uma pasta com "Tibia 2.exe" + "_internal\", e nao um
+; .exe unico. Motivo em Tibia 2.spec (o onefile disparava "Security validation
+; failure: failed to obtain executable path for parent process"). Entao o
+; instalador copia a pasta INTEIRA para {app}, recursivamente.
+;
+; O PyInstaller com UPX ligado produz binario que o Defender marca como
+; Trojan:Win32/Wacatac.B!ml. O Tibia 2.spec tem upx=False; dist\ ainda pode conter
+; build antigo COM UPX, por isso a fonte e dist-noupx explicitamente.
+;
+; Sobre nao disparar auto-update na primeira aberta: o launcher compara a sua
+; LAUNCHER_VERSION (baked no codigo) com o "version" do launcher.json. Como a
+; pasta instalada carrega a mesma versao que foi publicada, quem instala do zero
+; nao ve update imediato. Ver docs/deploy-online.md.
+Source: "dist-noupx\{#MyAppName}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

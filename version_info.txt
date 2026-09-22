@@ -1,0 +1,50 @@
+# Metadados de versao do launcher (recurso VERSIONINFO do Windows).
+#
+# POR QUE ISTO EXISTE
+#
+# O executavel saia com CompanyName, ProductName, FileVersion e LegalCopyright
+# TODOS VAZIOS. Isso custa em dois lugares:
+#
+#   1. Heuristica. O Defender marcou o launcher como Trojan:Win32/Wacatac.B!ml -
+#      o sufixo !ml quer dizer veredito de modelo, nao assinatura. Executavel
+#      sem metadado nenhum, sem assinatura e que baixa e executa arquivos (que e
+#      literalmente o trabalho de um launcher) e o retrato do que esses modelos
+#      aprenderam a marcar. Metadado nao garante nada, mas tira um sinal.
+#
+#   2. O que o jogador LE. Sem ProductName, o aviso do SmartScreen diz so
+#      "Editor desconhecido" e nao nomeia nada. Com estes campos, ao menos o
+#      nome do jogo aparece nas propriedades do arquivo e no dialogo.
+#
+# O QUE ISTO NAO RESOLVE: SmartScreen e REPUTACAO, nao analise. Binario sem
+# assinatura e sem historico de downloads continua avisando, por mais completo
+# que seja o metadado. So certificado de assinatura de codigo resolve isso.
+#
+# Ao subir versao do launcher, mexa em filevers, prodvers, FileVersion e
+# ProductVersion juntos - os quatro tem de contar a mesma historia.
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 0, 0, 0),
+    prodvers=(1, 0, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        '040904B0',
+        [StringStruct('CompanyName', 'Tibia 2'),
+         StringStruct('FileDescription', 'Tibia 2 Launcher'),
+         StringStruct('FileVersion', '1.0.0.0'),
+         StringStruct('InternalName', 'Tibia2Launcher'),
+         StringStruct('LegalCopyright', 'Copyright (c) Tibia 2'),
+         StringStruct('OriginalFilename', 'Tibia 2.exe'),
+         StringStruct('ProductName', 'Tibia 2'),
+         StringStruct('ProductVersion', '1.0.0.0')])
+    ]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)

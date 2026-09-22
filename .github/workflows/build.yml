@@ -19,36 +19,25 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Build exe
-        run: >
-          pyinstaller --onefile --noconsole --clean --noconfirm
-          --name "Tibia 2" --icon "assets/shield.ico"
-          --add-data "assets;assets" launcher.py
+      # Build ONEDIR (pasta), definido pelo "Tibia 2.spec" (exclude_binaries + COLLECT).
+      #
+      # Onedir e nao onefile: o bootloader onefile do PyInstaller 6 extrai tudo para
+      # %TEMP%, relanca uma copia de si mesmo e o filho faz uma "security validation"
+      # que abre o processo-PAI (QueryFullProcessImageNameW). Quando AV/EDR intercepta,
+      # aborta com "Security validation failure: failed to obtain executable path for
+      # parent process" - era o erro intermitente ao abrir o launcher. Onedir nao
+      # relanca processo-filho, entao essa rotina nunca roda. Ver Tibia 2.spec.
+      #
+      # Saida: dist-noupx\Tibia 2\Tibia 2.exe + dist-noupx\Tibia 2\_internal\.
+      - name: Build (onedir)
+        run: python -m PyInstaller --noconfirm --distpath dist-noupx --workpath build-noupx "Tibia 2.spec"
 
-      # launcher.json: crc do exe (formato do launcher: hex, sem zeros a esquerda)
-      # para o auto-update. Quando ligar a assinatura, gere ISTO DEPOIS de assinar
-      # o exe (o crc tem que ser o do exe realmente distribuido).
-      - name: Launcher version (launcher.json)
-        shell: pwsh
-        run: |
-          $crc = python -c "import zlib; print(format(zlib.crc32(open(r'dist/Tibia 2.exe','rb').read()) & 0xffffffff, 'x'))"
-          $json = '{"crc":"' + $crc.Trim() + '","url":"https://tibia2ot.com/templates/tibia2/Tibia%202.exe"}'
-          Set-Content -Path 'dist/launcher.json' -Value $json -NoNewline
-          Get-Content 'dist/launcher.json'
-
-      - name: Build installer (Inno Setup)
-        shell: pwsh
-        run: |
-          choco install innosetup --no-progress -y
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
-
-      # --- Assinatura de código (SignPath) -------------------------------------
-      # Quando ligar: assine dist/Tibia 2.exe ANTES do passo do instalador (para o
-      # launcher instalado ficar assinado) e assine tambem o dist/Tibia 2 Setup.exe.
-      # Descomente quando o projeto for aprovado no SignPath Foundation
-      # (https://about.signpath.io/product/open-source). O passo pega o
-      # "dist/Tibia 2.exe", envia para assinatura e devolve o mesmo caminho
-      # assinado. Configure os secrets SIGNPATH_* / SIGNPATH_API_TOKEN no repo.
+      # --- Assinatura de codigo (SignPath) -------------------------------------
+      # Quando ligar: assine dist-noupx\Tibia 2\Tibia 2.exe ANTES do passo do
+      # instalador (para a pasta instalada ficar assinada) e assine tambem o
+      # dist\Tibia 2 Setup.exe. Descomente apos aprovacao no SignPath Foundation
+      # (https://about.signpath.io/product/open-source) e configure os secrets
+      # SIGNPATH_* / SIGNPATH_API_TOKEN no repo.
       #
       # - name: Sign with SignPath
       #   uses: signpath/github-action-submit-signing-request@v1
@@ -60,7 +49,22 @@ jobs:
       #     artifact-configuration-slug: exe
       #     github-artifact-id: ${{ steps.upload.outputs.artifact-id }}
       #     wait-for-completion: true
-      #     output-artifact-directory: dist
+      #     output-artifact-directory: dist-noupx/Tibia 2
+
+      # Instalador Inno: empacota a pasta onedir (dist-noupx\Tibia 2\*) e escreve
+      # dist\Tibia 2 Setup.exe. Ver installer.iss.
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+
+      # launcher.json (auto-update) NAO e gerado aqui de proposito. A distribuicao e
+      # feita pelo deploy do monorepo (scripts/deploy/deploy-cliente.ps1), que le a
+      # LAUNCHER_VERSION do launcher.py, zipa a pasta onedir, calcula o zip_crc do
+      # zip REALMENTE publicado e escreve {version, zip_crc, url}. Um launcher.json
+      # gerado aqui (crc de OUTRO zip) nao casaria com o que o servidor serve e
+      # jogaria todo mundo num laco de auto-update. Ver deploy-online.md no monorepo.
 
       - name: Upload artifact
         id: upload
@@ -68,9 +72,8 @@ jobs:
         with:
           name: Tibia2-launcher
           path: |
-            dist/Tibia 2.exe
+            dist-noupx/Tibia 2
             dist/Tibia 2 Setup.exe
-            dist/launcher.json
           if-no-files-found: error
 
       - name: Attach to release
@@ -78,6 +81,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/Tibia 2.exe
             dist/Tibia 2 Setup.exe
-            dist/launcher.json

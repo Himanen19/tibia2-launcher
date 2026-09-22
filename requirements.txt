@@ -1,5 +1,9 @@
 # Runtime
 pillow>=10.0
+# Validacao HTTPS com a nossa lista de raizes (o launcher usa certifi em vez do
+# repositorio de certificados do Windows). O Tibia 2.spec faz hiddenimports=['certifi'],
+# entao ele precisa estar instalado no ambiente de build tambem.
+certifi
 
 # Build
 pyinstaller>=6.0

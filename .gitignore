@@ -1,7 +1,10 @@
 # PyInstaller
 build/
 dist/
-*.spec
+# Build ONEDIR (o Tibia 2.spec usa --distpath dist-noupx / --workpath build-noupx).
+build-noupx/
+dist-noupx/
+# NAO ignore *.spec: o build onedir e DEFINIDO pelo "Tibia 2.spec" (versionado).
 
 # Python
 __pycache__/
