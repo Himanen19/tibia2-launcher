@@ -57,7 +57,7 @@ CLIENT_EXE = "Tibia 2 Client.exe"
 # o codigo vive espalhado em _internal\ e nao mais num unico .exe com um CRC. O
 # deploy LE este valor daqui (nunca digita no JSON) - ver deploy-cliente.ps1.
 # BUMP a cada launcher que for publicado, senao o auto-update nao dispara.
-LAUNCHER_VERSION = "2026-09-24"
+LAUNCHER_VERSION = "2026-09-25"
 HTTP_TIMEOUT = 30
 # TODA requisicao do launcher tem de mandar este User-Agent.
 #
@@ -1122,12 +1122,14 @@ class Launcher:
     def _poster(self, w, h, it, kind):
         if kind == "tw":
             card = rgrad_card(w, h, (22, 50, 79), (14, 32, 56), 9)
-            # fundo = miniatura da live (cover-fit); o gradiente fica so ate baixar
-            th = self._thumb(it.get("thumb"), w, h)
-            if th is not None:
-                card.alpha_composite(th, (0, 0))
         else:
             card = rgrad_card(w, h, (58, 22, 32), (26, 13, 20), 9)
+        # fundo = miniatura (twitch: frame da live; youtube: thumb do video),
+        # cover-fit. O gradiente fica so ate a imagem baixar. No YT o botao de
+        # play (desenhado abaixo) cai POR CIMA -> cara de card do YouTube.
+        th = self._thumb(it.get("thumb"), w, h)
+        if th is not None:
+            card.alpha_composite(th, (0, 0))
         cd = sdraw(card)
         card.alpha_composite(scrim(w, int(h * 0.62)), (0, h - int(h * 0.62)))
         cd.rounded_rectangle([0, 0, w - 1, h - 1], radius=9, outline=LINE2)
