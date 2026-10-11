@@ -9,6 +9,12 @@ O jogador baixa só o launcher (~20 MB). Na primeira execução, com a pasta vaz
 o launcher baixa o cliente inteiro (em paralelo) e abre o jogo. Nas próximas, só
 baixa o que mudou.
 
+## Download
+
+Installer and portable build: **[Releases](https://github.com/Himanen19/tibia2-launcher/releases/latest)**.
+Players normally get it from [tibia2ot.com/downloads](https://tibia2ot.com/downloads).
+See the [Code signing policy](#code-signing-policy) below.
+
 ## Por que um programa separado
 
 O updater embutido do OTClient roda *antes* do `loadModules`, num ponto em que o

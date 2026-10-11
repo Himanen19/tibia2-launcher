@@ -9,6 +9,10 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    # contents: write = o passo "Attach to release" cria o release da tag (sem isto o
+    # GitHub responde 403 "Resource not accessible by integration").
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
