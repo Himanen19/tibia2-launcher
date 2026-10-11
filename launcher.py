@@ -23,8 +23,11 @@ import sys
 import json
 import time
 import zlib
+import base64
+import hashlib
 import queue
 import ctypes
+import platform
 import threading
 import subprocess
 import webbrowser
@@ -46,18 +49,44 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk, ImageFilter
 # LINKS: placeholders - o dono troca depois.
 # ---------------------------------------------------------------------------
 UPDATER_URL = os.environ.get("PANGEIA_UPDATER_URL", "https://tibia2ot.com/updater.php")
+
+# Downloads simultaneos do cliente (ver _download_one / baixa). O que pesa e a
+# latencia por pedido (~15,7 mil arquivos, a maioria pequena), nao a banda: mais
+# conexoes persistentes = mais arquivos por segundo. Medido em 02/10/2026 contra a
+# producao, borda fria, 240 arquivos: 16 conexoes = 279 arquivos/s, 24 = 394.
+# Eram 8, depois 16.
+DOWNLOAD_WORKERS = 32
 NEWS_URL = os.environ.get("PANGEIA_NEWS_URL", "https://tibia2ot.com/noticias.php")
+# Relato de falha (anonimo, agregado por mensagem+versao no servidor - tabela
+# client_errors). Sem isto uma falha de download so ficava no PC do jogador e
+# ninguem sabia que "faltou arquivo". A Cloudflare ja isenta esta rota.
+REPORT_URL = os.environ.get("PANGEIA_REPORT_URL", "https://tibia2ot.com/client-error-report")
 # Info do proprio launcher (crc + url do exe) para o auto-update.
 LAUNCHER_INFO_URL = os.environ.get("PANGEIA_LAUNCHER_INFO",
                                    "https://tibia2ot.com/templates/tibia2/launcher.json")
 CLIENT_EXE = "Tibia 2 Client.exe"
+# Copias com o nome do rebrand OTibion (29/09, REVERTIDO em 30/09), publicadas ate
+# 01/10 e que ficaram paradas no disco de quem atualizou naquela janela (o updater
+# nao apaga nada). faxina_heranca_otibion() as remove.
+EXES_HERANCA_OTIBION = ("OTibion Client.exe", "OTibion.exe")
 # Versao DESTE launcher. O auto-update compara com o "version" do launcher.json
 # publicado: diferente => baixa a pasta nova e troca (ver self_update). No onedir
 # esse constante e o unico jeito barato de o launcher saber que esta velho, ja que
 # o codigo vive espalhado em _internal\ e nao mais num unico .exe com um CRC. O
 # deploy LE este valor daqui (nunca digita no JSON) - ver deploy-cliente.ps1.
 # BUMP a cada launcher que for publicado, senao o auto-update nao dispara.
-LAUNCHER_VERSION = "2026-09-25"
+LAUNCHER_VERSION = "2026-10-10.1"
+
+# ASSINATURA DAS ATUALIZACOES (auditoria 2026-10-01, segunda rodada; decisao do
+# dono 2026-10-03). O CRC do manifesto so prova que o arquivo chegou inteiro, nao
+# de quem veio: quem escrevesse na arvore do VPS ou mexesse na borda entregava um
+# exe ou um launcher.zip qualquer a todo jogador. O release (no PC do dono) assina
+# com Ed25519 um manifesto com o SHA-256 de cada arquivo; aqui so mora a chave
+# PUBLICA. Download que nao bate com a assinatura e recusado - inclusive o do
+# proprio launcher. Ver scripts/deploy/assinatura.py.
+CHAVE_PUBLICA_RELEASE = "92f26fc4f11cf279b33e5119a3817875341e42e956669c7ad75b75eaa80e30ba"
+ASSINATURA_URL = os.environ.get("PANGEIA_ASSINATURA_URL",
+                                "https://tibia2ot.com/templates/tibia2/assinatura.json")
 HTTP_TIMEOUT = 30
 # TODA requisicao do launcher tem de mandar este User-Agent.
 #
@@ -71,7 +100,13 @@ HTTP_TIMEOUT = 30
 # O UA e identificavel de proposito (e nao um Chrome falso): assim da para
 # reconhecer o launcher no log da borda e criar regra para ele se um dia a
 # protecao apertar. Medido: com este UA o updater.php responde 200.
-USER_AGENT = "Tibia2-Launcher/1.0 (+https://tibia2ot.com)"
+# Leva a VERSAO e o NOME com que o launcher foi aberto: o log de acesso do Caddy
+# (lido pelo painel do /admin) mostra quantos launchers de cada versao existem.
+# Continua comecando com "Tibia2-Launcher/", que e o que as regras e os logs
+# reconhecem.
+_EXE_ABERTO = os.path.basename(sys.executable) if getattr(sys, "frozen", False) else "dev"
+USER_AGENT = "Tibia2-Launcher/%s (%s; +https://tibia2ot.com)" % (
+    LAUNCHER_VERSION, _EXE_ABERTO if _EXE_ABERTO.isascii() else "exe")
 
 # ---------------------------------------------------------------------------
 # CONTEUDO DINAMICO (a UI le do servidor pra quase nunca precisar rebuildar o
@@ -284,6 +319,26 @@ def http_post_json(url, payload):
         return json.loads(r.read().decode("utf-8"))
 
 
+def reportar_falha(mensagem):
+    """Manda UMA mensagem agregada ao servidor (client_errors). Melhor esforco:
+    nunca levanta, nunca atrasa o jogador mais que 8s. version = so os digitos
+    de LAUNCHER_VERSION (a coluna e inteira); a versao completa vai no texto."""
+    try:
+        corpo = json.dumps({
+            "message": ("[launcher %s] %s" % (LAUNCHER_VERSION, mensagem))[:1900],
+            "level": "launcher",
+            "version": int("".join(ch for ch in LAUNCHER_VERSION if ch.isdigit())[:9] or 0),
+            "player": "",
+            "os": platform.platform()[:60],
+        }).encode("utf-8")
+        req = urllib.request.Request(REPORT_URL, data=corpo, headers={
+            "Content-Type": "application/json", "User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=8, context=_SSL_CTX) as r:
+            r.read()
+    except Exception:
+        pass
+
+
 def http_get_json(url):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=_SSL_CTX) as r:
@@ -295,6 +350,123 @@ def http_get_bytes(url):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=_SSL_CTX) as r:
         return r.read()
+
+
+# ---------------------------------------------------------------------------
+# Ed25519 (so VERIFICAR; RFC 8032, implementacao de referencia em Python puro -
+# nenhuma biblioteca a mais no pacote). Conferida no scripts/deploy/assinatura.py
+# contra o vetor da RFC e contra a biblioteca cryptography.
+_EP = 2 ** 255 - 19
+_EL = 2 ** 252 + 27742317777372353535851937790883648493
+_ED = -121665 * pow(121666, _EP - 2, _EP) % _EP
+_EI = pow(2, (_EP - 1) // 4, _EP)
+
+
+def _ed_x(y, sinal):
+    if y >= _EP:
+        return None
+    x2 = (y * y - 1) * pow(_ED * y * y + 1, _EP - 2, _EP)
+    if x2 % _EP == 0:
+        return None if sinal else 0
+    x = pow(x2, (_EP + 3) // 8, _EP)
+    if (x * x - x2) % _EP != 0:
+        x = x * _EI % _EP
+    if (x * x - x2) % _EP != 0:
+        return None
+    if (x & 1) != sinal:
+        x = _EP - x
+    return x
+
+
+_EGY = 4 * pow(5, _EP - 2, _EP) % _EP
+_EGX = _ed_x(_EGY, 0)
+_EG = (_EGX, _EGY, 1, _EGX * _EGY % _EP)
+
+
+def _ed_soma(a, b):
+    A = (a[1] - a[0]) * (b[1] - b[0]) % _EP
+    B = (a[1] + a[0]) * (b[1] + b[0]) % _EP
+    C = 2 * a[3] * b[3] * _ED % _EP
+    D = 2 * a[2] * b[2] % _EP
+    E, F, G, H = B - A, D - C, D + C, B + A
+    return (E * F % _EP, G * H % _EP, F * G % _EP, E * H % _EP)
+
+
+def _ed_mult(k, ponto):
+    q = (0, 1, 1, 0)
+    while k > 0:
+        if k & 1:
+            q = _ed_soma(q, ponto)
+        ponto = _ed_soma(ponto, ponto)
+        k >>= 1
+    return q
+
+
+def _ed_ponto(b32):
+    if len(b32) != 32:
+        return None
+    y = int.from_bytes(b32, "little")
+    sinal = y >> 255
+    y &= (1 << 255) - 1
+    x = _ed_x(y, sinal)
+    if x is None:
+        return None
+    return (x, y, 1, x * y % _EP)
+
+
+def ed25519_verificar(publica, mensagem, assinatura):
+    if len(publica) != 32 or len(assinatura) != 64:
+        return False
+    A = _ed_ponto(publica)
+    R = _ed_ponto(assinatura[:32])
+    if A is None or R is None:
+        return False
+    sv = int.from_bytes(assinatura[32:], "little")
+    if sv >= _EL:
+        return False
+    h = int.from_bytes(hashlib.sha512(assinatura[:32] + publica + mensagem).digest(), "little") % _EL
+    a = _ed_mult(sv, _EG)
+    b = _ed_soma(R, _ed_mult(h, A))
+    return (a[0] * b[2] - b[0] * a[2]) % _EP == 0 and (a[1] * b[2] - b[1] * a[2]) % _EP == 0
+
+
+def carregar_assinatura():
+    """Baixa o envelope assinado do release e confere com a chave publica.
+    Devolve o manifesto (dict) ou None - None quer dizer "nao confio em nada que
+    vier do servidor agora". Manifesto e assinatura vem no MESMO arquivo (nunca um
+    par desencontrado); o `?t=` fura cache de borda."""
+    try:
+        bruto = http_get_bytes(ASSINATURA_URL + "?t=" + str(int(time.time())))
+    except Exception as e:
+        log_erro("baixar assinatura do release", e, ASSINATURA_URL)
+        return None
+    try:
+        env = json.loads(bruto.decode("ascii"))
+        dados = base64.b64decode(env["manifesto"], validate=True)
+        sig = base64.b64decode(env["sig"], validate=True)
+    except Exception as e:
+        log_erro("assinatura do release ilegivel", e, ASSINATURA_URL)
+        return None
+    if not ed25519_verificar(bytes.fromhex(CHAVE_PUBLICA_RELEASE), dados, sig):
+        log_erro("assinatura do release INVALIDA", None, ASSINATURA_URL)
+        reportar_falha("assinatura do release invalida (%d bytes)" % len(bruto))
+        return None
+    try:
+        man = json.loads(dados.decode("ascii"))
+    except Exception as e:
+        log_erro("manifesto assinado ilegivel", e, ASSINATURA_URL)
+        return None
+    if not isinstance(man, dict) or not isinstance(man.get("cliente"), dict):
+        return None
+    return man
+
+
+def sha256_of(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def rel_to_local(root, rel):
@@ -333,6 +505,17 @@ SOC_GAP = 9
 SOC_Y = FOOT_Y + (FOOT_H - SB) // 2
 SOCIALS = [("twitch", "Twitch"), ("discord", "Discord"),
            ("instagram", "Instagram"), ("youtube", "YouTube"), ("site", "Site")]
+
+# FUNDO: a mesma arte da tela de login do cliente (assets/background.jpg, 16:9, sem o
+# escudo - a barra de titulo ja tem o dela). Aparece duas vezes: desfocada e escurecida
+# atras da janela inteira, com os paineis em vidro escuro por cima, e nitida no cartao
+# de destaque. Sem o arquivo (ou se ele nao abrir) a janela volta ao degrade liso de
+# antes - o launcher nunca deixa de abrir por causa de imagem.
+FUNDO_ARQ = "background.jpg"
+FUNDO_ESCURO = 0.36                         # quanto do fundo desfocado vira GROUND2
+FUNDO_DESFOQUE = 6                          # raio, medido na janela em 1x
+HERO_ARTE_TOPO = 0.160                      # o recorte do destaque comeca a esta fracao da altura da arte
+VIDRO_BARRA, VIDRO_PAINEL, VIDRO_RODAPE = 165, 188, 190   # alfa (0-255) do vidro de cada faixa
 
 CARD_ROT_MS = 10000                         # lives + youtube trocam JUNTOS (timer unico)
 CAROUSEL_MS = 30000                         # carrossel de destaques
@@ -373,6 +556,10 @@ I18N = {
         "Atualizacao indisponivel - jogando com o que ha.":
             "Update unavailable - playing with what's here.",
         "Cliente pronto. Boa caçada!": "Client ready. Happy hunting!",
+        "Refazendo arquivos que falharam...": "Retrying files that failed...",
+        "Alguns arquivos nao baixaram. Clique em TENTAR DE NOVO.":
+            "Some files did not download. Click TRY AGAIN.",
+        "TENTAR DE NOVO": "TRY AGAIN",
     },
     "es": {
         "LAUNCHER OFICIAL": "LANZADOR OFICIAL",
@@ -400,6 +587,10 @@ I18N = {
         "Atualizacao indisponivel - jogando com o que ha.":
             "Actualizacion no disponible - jugando con lo que hay.",
         "Cliente pronto. Boa caçada!": "Cliente listo. ¡Buena cacería!",
+        "Refazendo arquivos que falharam...": "Reintentando archivos que fallaron...",
+        "Alguns arquivos nao baixaram. Clique em TENTAR DE NOVO.":
+            "Algunos archivos no se descargaron. Haz clic en REINTENTAR.",
+        "TENTAR DE NOVO": "REINTENTAR",
     },
 }
 
@@ -733,6 +924,7 @@ class Launcher:
         except Exception:
             self._shield = None
         self._social_icons = self._load_social_icons()
+        self._carregar_fundo()
         # botao ENTRAR NO JOGO: borda conica girando, camada POR CIMA do base
         try:
             self._cta_frames, self._cta_pad = build_cta_frames(
@@ -749,6 +941,12 @@ class Launcher:
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Motion>", self._on_move)
         self.tk.bind("<Escape>", lambda e: self._close_overlays())
+        # Rolagem do texto da noticia aberta (modal): roda do mouse e teclado.
+        self.canvas.bind("<MouseWheel>", lambda e: self._rolar_modal(-60 if e.delta > 0 else 60))
+        self.tk.bind("<Up>", lambda e: self._rolar_modal(-40))
+        self.tk.bind("<Down>", lambda e: self._rolar_modal(40))
+        self.tk.bind("<Prior>", lambda e: self._rolar_modal(-200))
+        self.tk.bind("<Next>", lambda e: self._rolar_modal(200))
         self.render()
         if self._ctatk:
             self.tk.after(70, self._tick_cta)
@@ -763,6 +961,48 @@ class Launcher:
             except Exception:
                 icons[key] = None
         return icons
+
+    def _carregar_fundo(self):
+        """Monta UMA vez, em 2x, as duas camadas da arte: self._fundo (janela inteira,
+        desfocada e escurecida) e self._hero_arte (recorte nitido do cartao de destaque,
+        ja com os cantos arredondados). Qualquer falha deixa as duas em None e o
+        _compose cai no degrade liso."""
+        self._fundo = self._hero_arte = None
+        try:
+            arte = Image.open(asset(FUNDO_ARQ)).convert("RGB")
+            aw, ah = arte.size
+            # janela: cobre (corta a sobra dos lados), desfoca pequeno e amplia - o
+            # desfoque em 1/4 do tamanho custa uma fracao e o resultado e o mesmo
+            fw, fh = W * SS, H * SS
+            esc = max(fw / aw, fh / ah)
+            cw, ch = min(aw, round(fw / esc)), min(ah, round(fh / esc))
+            cx, cy = (aw - cw) // 2, (ah - ch) // 2
+            peq = arte.crop((cx, cy, cx + cw, cy + ch)).resize((W // 2, H // 2), Image.LANCZOS)
+            peq = peq.filter(ImageFilter.GaussianBlur(FUNDO_DESFOQUE / 2.0))
+            fundo = peq.resize((fw, fh), Image.BICUBIC)
+            fundo = Image.blend(fundo, Image.new("RGB", (fw, fh), GROUND2), FUNDO_ESCURO)
+            # destaque: a largura toda da arte, na proporcao do cartao
+            hw, hh = HERO[2] * SS, HERO[3] * SS
+            rh = min(ah, round(aw * hh / hw))
+            top = max(0, min(ah - rh, round(ah * HERO_ARTE_TOPO)))
+            hero = arte.crop((0, top, aw, top + rh)).resize((hw, hh), Image.LANCZOS).convert("RGBA")
+            m = Image.new("L", (hw, hh), 0)
+            ImageDraw.Draw(m).rounded_rectangle([0, 0, hw - 1, hh - 1], radius=12 * SS, fill=255)
+            hero.putalpha(m)
+            self._fundo, self._hero_arte = fundo.convert("RGBA"), hero
+        except Exception:
+            self._fundo = self._hero_arte = None
+
+    def _vidro(self, img, x, y, w, h, cor, alfa, r=0):
+        """Retangulo translucido (vidro escuro) por cima do fundo. O ImageDraw num RGBA
+        SUBSTITUI o pixel em vez de misturar, por isso vai por alpha_composite."""
+        pw, ph = max(1, int(w * SS)), max(1, int(h * SS))
+        placa = Image.new("RGBA", (pw, ph), tuple(cor) + (alfa,))
+        if r:
+            m = Image.new("L", (pw, ph), 0)
+            ImageDraw.Draw(m).rounded_rectangle([0, 0, pw - 1, ph - 1], radius=int(r * SS), fill=alfa)
+            placa.putalpha(m)
+        img.alpha_composite(placa, (x, y))
 
     # ---- idioma ---------------------------------------------------------
     def t(self, s):
@@ -831,7 +1071,8 @@ class Launcher:
         """Renderiza a janela inteira em 2x (SS) e reduz pra WxH (LANCZOS).
         Testavel sem tk. Preenche self._regions (coords LOGICAS p/ hit-test)."""
         self._regions = []
-        base = vgrad(W * SS, H * SS, (13, 24, 38), GROUND2).convert("RGBA")
+        fundo = getattr(self, "_fundo", None)
+        base = fundo.copy() if fundo is not None else vgrad(W * SS, H * SS, (13, 24, 38), GROUND2).convert("RGBA")
         img = SImg(base)
         d = sdraw(img)
         d.line([(0, 0), (W, 0)], fill=GOLD, width=2)
@@ -856,6 +1097,10 @@ class Launcher:
             self.canvas.tag_raise(self.cta_item)
 
     def _panel(self, img, d, x, y, w, h, fill=SURFA, r=12):
+        if getattr(self, "_fundo", None) is not None:
+            self._vidro(img, x, y, w, h, fill, VIDRO_PAINEL, r)
+            d.rounded_rectangle([x, y, x + w - 1, y + h - 1], radius=r, outline=GOLDD)
+            return
         d.rounded_rectangle([x, y, x + w - 1, y + h - 1], radius=r, fill=fill, outline=GOLDD)
 
     def _wbtn(self, img, d, rect, kind):
@@ -878,7 +1123,10 @@ class Launcher:
         self._reg(x, y, w, h, kind)
 
     def _draw_titlebar(self, img, d):
-        d.rectangle([0, 1, W, BAR_H], fill=(14, 33, 47))
+        if getattr(self, "_fundo", None) is not None:
+            self._vidro(img, 0, 1, W, BAR_H - 1, (9, 20, 31), VIDRO_BARRA)
+        else:
+            d.rectangle([0, 1, W, BAR_H], fill=(14, 33, 47))
         d.line([(0, BAR_H), (W, BAR_H)], fill=LINE)
         if self._shield:
             s = self._shield.copy(); s.thumbnail((46 * SS, 46 * SS)); img.alpha_composite(s, (PAD, 13))
@@ -931,16 +1179,22 @@ class Launcher:
         pal = {"evento": ((16, 34, 55), (11, 24, 50)), "loja": ((28, 20, 56), (13, 16, 48)),
                "update": ((16, 30, 47), (11, 22, 38))}
         top, bot = pal.get(tag, ((16, 33, 54), (11, 23, 48)))
-        card = rgrad_card(hw, hh, top, bot, 12)
+        arte = getattr(self, "_hero_arte", None)
+        card = SImg(arte.copy()) if arte is not None else rgrad_card(hw, hh, top, bot, 12)
         cd = sdraw(card)
-        # scrim esquerda + base (legibilidade do texto) - veil em 2x
+        # scrim esquerda + base (legibilidade do texto) - veil em 2x. Com a arte por
+        # baixo o veu da esquerda e mais leve e mais curto: escurece so onde o texto
+        # mora e deixa o resto da cena a mostra.
+        forca, alcance = (150, 0.60) if arte is not None else (215, 0.72)
         vw, vh = hw * SS, hh * SS
         veil = Image.new("RGBA", (vw, vh), (0, 0, 0, 0)); vd = ImageDraw.Draw(veil)
         for xx in range(vw):  # passo 1 = gradiente continuo (passo 2 virava listras)
-            a = int(215 * max(0.0, 1 - xx / (vw * 0.72)))
+            a = int(forca * max(0.0, 1 - xx / (vw * alcance)))
             vd.line([(xx, 0), (xx, vh)], fill=(6, 10, 18, a))
         card.alpha_composite(veil, (0, 0))
         card.alpha_composite(scrim(hw, int(hh * 0.55)), (0, hh - int(hh * 0.55)))
+        if arte is not None:      # veu e scrim pintam os cantos; devolve o recorte arredondado
+            card.img.putalpha(arte.getchannel("A"))
         # badge + titulo + texto
         badgecol = {"evento": EVT, "loja": LOJA, "update": BLUE}.get(tag, BLUE)
         btxt = (sl.get("tag") or "Destaque").upper()
@@ -1139,6 +1393,11 @@ class Launcher:
             v = it.get("viewers")
             if v is not None:
                 self._badge_dark_r(cd, w - 8, 8, self._fmtnum(v), dot=LIVE)
+            if it.get("boost"):
+                # canal turbinado (parceiros-live, boost.php): quem assiste ganha
+                # Drops Coin mais rapido -> selo dourado + borda dourada no card
+                self._badge_gold(cd, 8, 30, "DROPS %dx" % int(it.get("boost_mult") or 2))
+                cd.rounded_rectangle([0, 0, w - 1, h - 1], radius=9, outline=GOLD, width=2)
             who = it.get("display") or it.get("login") or "canal"
             title = it.get("title") or ""
             meta = who; avcol = GOLD; date = ""
@@ -1171,6 +1430,11 @@ class Launcher:
         if dot:
             cd.ellipse([tx, y + 7, tx + 5, y + 12], fill=dot); tx += 10
         cd.text((tx, y + 4), text, font=f, fill=(255, 255, 255))
+
+    def _badge_gold(self, cd, x, y, text):
+        f = pil_font(10, "uib"); tw = _tw(cd, text, f)
+        cd.rounded_rectangle([x, y, x + tw + 12, y + 18], radius=5, fill=GOLD)
+        cd.text((x + 6, y + 4), text, font=f, fill=(20, 14, 4))
 
     def _badge_dark_r(self, cd, xr, y, text, dot=None):
         f = pil_font(10, "uib"); tw = _tw(cd, text, f)
@@ -1217,7 +1481,10 @@ class Launcher:
 
     # ---- rodape ---------------------------------------------------------
     def _draw_footer(self, img, d):
-        d.rectangle([0, FOOT_Y, W, H], fill=(14, 26, 40))
+        if getattr(self, "_fundo", None) is not None:
+            self._vidro(img, 0, FOOT_Y, W, FOOT_H, (9, 18, 28), VIDRO_RODAPE)
+        else:
+            d.rectangle([0, FOOT_Y, W, H], fill=(14, 26, 40))
         d.line([(0, FOOT_Y), (W, FOOT_Y)], fill=LINE)
         x = PAD
         for key, label in SOCIALS:
@@ -1292,7 +1559,7 @@ class Launcher:
         mv = self.st["modal"]
         img.alpha_composite(Image.new("RGBA", (W * SS, H * SS), (4, 7, 12, 205)), (0, 0))
         self._reg(0, 0, W, H, "mclose")
-        mw, mh = 560, 360
+        mw, mh = 560, 460
         mx, my = (W - mw) // 2, (H - mh) // 2
         d.rounded_rectangle([mx, my, mx + mw, my + mh], radius=13, fill=(16, 28, 40), outline=GOLDD)
         img.alpha_composite(rgrad_card(mw - 2, 6, GOLDL, GOLDD, 3), (mx + 1, my + 1))
@@ -1313,16 +1580,44 @@ class Launcher:
         ty = my + 46
         for ln in wrap2(d, mv.get("titulo", ""), pil_font(19, "disp"), mw - 90):
             d.text((mx + 22, ty), ln, font=pil_font(19, "disp"), fill=GOLDL); ty += 26
-        # corpo (quebra em varias linhas)
+        # corpo: monta TODAS as linhas e desenha so a janela visivel. Antes o
+        # texto era cortado no fim da caixa, sem rolagem - patch note comprida
+        # sumia pela metade. Rola pela roda do mouse e pelas setas/PageUp/PageDown
+        # (ver _rolar_modal).
         ty += 6
         bodyf = pil_font(13, "ui")
+        linhas, off = [], 0
         for para in (mv.get("texto") or "").split("\n"):
             if not para.strip():
-                ty += 8; continue
-            for ln in self._wrap_n(d, para, bodyf, mw - 44):
-                if ty > my + mh - 24:
-                    break
-                d.text((mx + 22, ty), ln, font=bodyf, fill=(211, 218, 231)); ty += 20
+                off += 8; continue
+            for ln in self._wrap_n(d, para, bodyf, mw - 56):
+                linhas.append((off, ln)); off += 20
+        topo, fundo = ty, my + mh - 20
+        vista = max(1, fundo - topo)
+        maxs = max(0, off - vista)
+        mv["max_scroll"] = maxs
+        rol = min(max(0, int(mv.get("scroll", 0))), maxs)
+        mv["scroll"] = rol
+        for o, ln in linhas:
+            y = topo + o - rol
+            if y < topo or y + 18 > fundo:
+                continue
+            d.text((mx + 22, y), ln, font=bodyf, fill=(211, 218, 231))
+        if maxs > 0:
+            sx = mx + mw - 16
+            d.rounded_rectangle([sx, topo, sx + 5, fundo], radius=2, fill=(11, 20, 33))
+            th = max(28, int(vista * vista / off))
+            sy = topo + int((vista - th) * rol / maxs)
+            d.rounded_rectangle([sx, sy, sx + 5, sy + th], radius=2, fill=GOLDD)
+
+    def _rolar_modal(self, passo):
+        mv = self.st.get("modal")
+        if not mv or not mv.get("max_scroll"):
+            return
+        novo = min(max(0, int(mv.get("scroll", 0)) + passo), mv["max_scroll"])
+        if novo != mv.get("scroll", 0):
+            mv["scroll"] = novo
+            self.render()
 
     @staticmethod
     def _wrap_n(d, s, f, maxw):
@@ -1488,6 +1783,10 @@ class Launcher:
                 os._exit(0)
         except Exception:
             pass
+        # Ja na versao atual: o atalho "OTibion" (rebrand revertido) volta a "Tibia 2"
+        # e as copias paradas com aquele nome saem da pasta.
+        migrar_atalho_desktop()
+        faxina_heranca_otibion(self.root)
 
         try:
             data = http_get_json(NEWS_URL)
@@ -1501,6 +1800,7 @@ class Launcher:
                                                     "os": "windows", "platform": 1, "args": {}})
         except Exception as e:
             log_erro("checar atualizacoes", e, UPDATER_URL)
+            reportar_falha("manifesto do updater indisponivel: %s: %s" % (type(e).__name__, e))
             self.q.put(("status", "Nao foi possivel checar atualizacoes. Veja tibia2-launcher.log"))
             self.q.put(("ready", "ABRIR JOGO"))
             return
@@ -1574,55 +1874,108 @@ class Launcher:
             self.q.put(("progress", 100)); self.q.put(("status", "Cliente atualizado. Boa caçada!"))
             self.q.put(("ready", "ABRIR JOGO")); return
 
-        # Download PARALELO: primeiro install sao 20k+ arquivos; sequencial seria
-        # lento demais (latencia por requisicao). 8 ao mesmo tempo esconde isso.
+        # So baixa o que a ASSINATURA do release conhece (ver CHAVE_PUBLICA_RELEASE):
+        # sem assinatura valida nao baixa nada - melhor nao atualizar do que
+        # instalar um arquivo que nao veio do release.
+        self.q.put(("status", "Conferindo a assinatura da atualizacao..."))
+        assinada = carregar_assinatura()
+        if assinada is None:
+            self.q.put(("status", "Nao foi possivel conferir a assinatura da atualizacao. Tente de novo em instantes."))
+            self.q.put(("ready", "TENTAR DE NOVO")); return
+        self._assinados = assinada["cliente"]
+
+        # Download PARALELO: primeiro install sao ~15k arquivos, metade com menos
+        # de 16 KB - o custo e a LATENCIA por requisicao, nao a banda. 16 ao mesmo
+        # tempo (eram 8) esconde isso; o servidor agora e o Caddy (estatico em Go)
+        # e, com o ?v=<crc>, a borda do Cloudflare - aguenta a concorrencia.
         # Cada arquivo baixado ja entra no cache (sem rehash na proxima abertura).
-        n = len(to_update)
-        state = {"done": 0, "err": None, "bytes": 0}
-        t0 = time.time()
+        #
+        # NAO PARA NO PRIMEIRO ERRO (2026-09-28). Antes, um arquivo que falhasse
+        # parava todo o resto e o jogador ficava com a instalacao pela metade ate
+        # clicar em TENTAR DE NOVO - "faltou arquivo". Agora baixa tudo, junta o
+        # que falhou e refaz ate 2 vezes com o MANIFESTO RECARREGADO: o servidor
+        # responde 404 a um ?v=<crc> que nao e mais o do arquivo (troca de versao
+        # no meio do download), e o manifesto novo traz o crc certo. So o que
+        # sobrar depois disso vira TENTAR DE NOVO - e e relatado ao servidor.
+        clock_err = threading.Lock()
 
-        def baixa(item):
-            rel, want = item
-            if state["err"]:
-                return
-            sz = 0
-            try:
-                self._download_one(base, rel)
-                st = os.stat(rel_to_local(self.root, rel))
-                sz = st.st_size
+        def rodada(itens, base_url):
+            n = len(itens)
+            state = {"done": 0, "bytes": 0}
+            falhas = []
+            t0 = time.time()
+
+            def baixa(item):
+                rel, want = item
+                sz = 0
+                try:
+                    self._download_one(base_url, rel, want)
+                    st = os.stat(rel_to_local(self.root, rel))
+                    sz = st.st_size
+                    with clock:
+                        cache[rel] = [st.st_size, st.st_mtime_ns, want]
+                except Exception as e:
+                    with clock_err:
+                        falhas.append((rel, want, "%s: %s" % (type(e).__name__, e)))
                 with clock:
-                    cache[rel] = [st.st_size, st.st_mtime_ns, want]
-            except Exception:
-                state["err"] = rel.lstrip('/')
-            with clock:
-                state["done"] += 1
-                state["bytes"] += sz
-                dn = state["done"]; by = state["bytes"]
-            self.q.put(("progress", 100.0 * dn / n))
-            # velocidade + tempo estimado: media movel simples desde o inicio.
-            # ETA por contagem de arquivos (o manifesto nao traz tamanho); com
-            # download paralelo a taxa de arquivos/s e estavel, entao a estimativa
-            # converge rapido.
-            if dn % 15 == 0 or dn == n:
-                el = max(0.001, time.time() - t0)
-                spd = by / el / 1e6                          # MB/s
-                eta = (el / dn) * (n - dn) if dn else 0      # segundos restantes
-                self.q.put(("dlstat", (dn, n, spd, eta)))
+                    state["done"] += 1
+                    state["bytes"] += sz
+                    dn = state["done"]; by = state["bytes"]
+                self.q.put(("progress", 100.0 * dn / n))
+                # velocidade + tempo estimado: media movel simples desde o inicio.
+                # ETA por contagem de arquivos (o manifesto nao traz tamanho); com
+                # download paralelo a taxa de arquivos/s e estavel, entao a estimativa
+                # converge rapido.
+                if dn % 15 == 0 or dn == n:
+                    el = max(0.001, time.time() - t0)
+                    spd = by / el / 1e6                          # MB/s
+                    eta = (el / dn) * (n - dn) if dn else 0      # segundos restantes
+                    self.q.put(("dlstat", (dn, n, spd, eta)))
 
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            list(ex.map(baixa, to_update))
+            with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as ex:
+                list(ex.map(baixa, itens))
+            return falhas
 
-        if state["err"]:
+        falhas = rodada(to_update, base)
+        for _refazer in range(2):
+            if not falhas:
+                break
+            self.q.put(("status", "Refazendo arquivos que falharam..."))
+            time.sleep(2 + 3 * _refazer)
+            try:
+                novo = http_post_json(UPDATER_URL, {"version": "launcher", "build": "1",
+                                                    "os": "windows", "platform": 1, "args": {}})
+                base = novo.get("url") or base
+                files = novo.get("files") or files
+            except Exception as e:
+                log_erro("recarregar manifesto", e, UPDATER_URL)
+            # Release novo no meio do caminho traz assinatura nova junto.
+            nova_assinatura = carregar_assinatura()
+            if nova_assinatura is not None:
+                self._assinados = nova_assinatura["cliente"]
+            # So o que falhou; com o crc do manifesto NOVO. Arquivo que saiu do
+            # manifesto nao precisa mais ser baixado.
+            refazer = [(rel, files[rel]) for rel, _w, _m in falhas if rel in files]
+            falhas = rodada(refazer, base) if refazer else []
+
+        if falhas:
             self._save_cache(cache)
-            self.q.put(("status", "Falha ao baixar %s" % state["err"]))
+            resumo = "; ".join("%s (%s)" % (rel, motivo) for rel, _w, motivo in falhas[:12])
+            reportar_falha("download falhou em %d arquivo(s) de %d: %s" % (len(falhas), len(to_update), resumo))
+            self.q.put(("status", "Alguns arquivos nao baixaram. Clique em TENTAR DE NOVO."))
             self.q.put(("ready", "TENTAR DE NOVO")); return
         self._save_cache(cache)
         self.q.put(("progress", 100)); self.q.put(("status", "Cliente pronto. Boa caçada!"))
         self.q.put(("ready", "ABRIR JOGO"))
 
-    def _download_one(self, base, rel):
+    def _download_one(self, base, rel, want=None):
         pr = urllib.parse.urlparse(base)
         path = pr.path.rstrip("/") + "/" + urllib.parse.quote(rel.lstrip("/"))
+        # URL VERSIONADA pelo crc do manifesto: o arquivo muda, a URL muda. O
+        # servidor da cache de 1 ano a esse pedido, o Cloudflare serve da borda
+        # (Sao Paulo) e nenhuma atualizacao fica presa a um cache velho.
+        if want:
+            path += "?v=" + urllib.parse.quote(str(want))
         local = rel_to_local(self.root, rel)
         os.makedirs(os.path.dirname(local), exist_ok=True)
         tmp = local + ".part"
@@ -1640,9 +1993,32 @@ class Launcher:
                 if r.status != 200:
                     r.read()
                     raise IOError("HTTP %d em %s" % (r.status, rel))
+                crc = 0
+                sha = hashlib.sha256()
                 with open(tmp, "wb") as f:
                     for chunk in iter(lambda: r.read(1 << 20), b""):
                         f.write(chunk)
+                        crc = zlib.crc32(chunk, crc)
+                        sha.update(chunk)
+                # CONFERE o que chegou contra o manifesto. Antes o arquivo baixado
+                # entrava no cache com o crc ESPERADO sem conferir - um cache
+                # velho no caminho (CDN, proxy) deixava sprite antigo instalado
+                # e dado como certo para sempre.
+                if want and format(crc & 0xFFFFFFFF, "x") != want:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                    raise IOError("crc diferente do manifesto em %s" % rel)
+                # E o que decide: o SHA-256 que o release ASSINOU. Arquivo fora da
+                # assinatura, ou com outro conteudo, nao entra.
+                assinados = getattr(self, "_assinados", None)
+                if assinados is None or assinados.get(rel) != sha.hexdigest():
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                    raise IOError("arquivo nao confere com a assinatura do release: %s" % rel)
                 os.replace(tmp, local)
                 return
             except (http.client.HTTPException, OSError) as e:
@@ -1795,7 +2171,7 @@ def release_mutex():
 # ---------------------------------------------------------------------------
 _SWAPPER_BAT = r"""@echo off
 setlocal enableextensions enabledelayedexpansion
-set "EXE=Tibia 2.exe"
+set "EXE=__EXE__"
 set "UPD=%~dp0"
 for %%I in ("%UPD%..") do set "APP=%%~fI"
 set "NEW=%UPD%new"
@@ -1844,6 +2220,11 @@ call :ren_retry "_internal.stage" "_internal"
 if errorlevel 1 goto commit_fail_b
 call :copy_retry "%NEW%\%EXE%" "%APP%\%EXE%"
 if errorlevel 1 goto commit_fail_c
+rem 4b) Os OUTROS nomes do launcher (rebrand: "Tibia 2.exe" e "OTibion.exe" sao o
+rem     MESMO programa; o codigo mora DENTRO do exe). Todos vao junto, senao o que
+rem     nao foi aberto fica com codigo velho sobre o _internal novo. Best-effort:
+rem     o par (_internal, %EXE%) ja e consistente, falhar aqui nao reverte nada.
+for %%F in ("%NEW%\*.exe") do if /i not "%%~nxF"=="%EXE%" copy /y "%%~fF" "%APP%\%%~nxF" >nul 2>&1
 
 rem 5) Sucesso. Loga e relanca. NAO apaga %UPD% aqui: este .bat roda de DENTRO
 rem    dele - um rmdir do proprio diretorio corta a leitura do batch no meio, e o
@@ -1955,6 +2336,89 @@ def _clear_marker(app):
     _rmtree_quieto(_marker_path(app))
 
 
+def _pasta_desktop():
+    """Area de trabalho do usuario pela API (SHGetKnownFolderPath) - acerta o Desktop
+    redirecionado para o OneDrive, que o caminho montado a mao (~\\Desktop) erra."""
+    try:
+        from ctypes import wintypes
+
+        class GUID(ctypes.Structure):
+            _fields_ = [("d1", wintypes.DWORD), ("d2", wintypes.WORD),
+                        ("d3", wintypes.WORD), ("d4", ctypes.c_ubyte * 8)]
+        # FOLDERID_Desktop = {B4BFCC3A-DB2C-424C-B029-7FE99A87C641}
+        fid = GUID(0xB4BFCC3A, 0xDB2C, 0x424C,
+                   (ctypes.c_ubyte * 8)(0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41))
+        p = ctypes.c_wchar_p()
+        if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(fid), 0, None, ctypes.byref(p)) != 0:
+            return None
+        try:
+            return p.value
+        finally:
+            ctypes.windll.ole32.CoTaskMemFree(p)
+    except Exception:
+        return None
+
+
+def migrar_atalho_desktop():
+    """O rebrand OTibion (29/09, REVERTIDO em 30/09) renomeou o atalho da area de
+    trabalho de "Tibia 2" para "OTibion" (launchers 2026-09-30.2 a .6), e o
+    instalador daquela fase criou o atalho ja como "OTibion". Aqui ele volta a se
+    chamar "Tibia 2".
+
+    RENOMEIA o .lnk em vez de recria-lo: recriar exige o shell do Windows (COM ou
+    PowerShell), e um exe PyInstaller disparando PowerShell e o padrao que antivirus
+    acusa. So mexe se o .lnk apontar para um exe nosso ("Tibia 2.exe" ou
+    "OTibion.exe" - os dois sao o mesmo launcher) e se ainda nao existir um
+    "Tibia 2.lnk". Idempotente e silencioso."""
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        desk = _pasta_desktop()
+        if not desk:
+            return
+        velho = os.path.join(desk, "OTibion.lnk")
+        novo = os.path.join(desk, "Tibia 2.lnk")
+        if not os.path.isfile(velho) or os.path.exists(novo):
+            return
+        with open(velho, "rb") as f:
+            dados = f.read(256 * 1024)
+        nosso = any(a.encode("utf-16-le") in dados or a.encode("ascii") in dados
+                    for a in ("Tibia 2.exe", "OTibion.exe"))
+        if not nosso:
+            return                             # atalho de outra coisa: nao e nosso
+        os.rename(velho, novo)
+        log_erro("atalho migrado", None, "OTibion.lnk -> Tibia 2.lnk em " + desk)
+    except Exception as e:
+        log_erro("migrar atalho", e)
+
+
+def faxina_heranca_otibion(root):
+    """Apaga "OTibion Client.exe" e "OTibion.exe" da pasta do jogo. Os dois foram
+    publicados de 29/09 a 01/10 (rebrand revertido) e, como o updater nunca apaga
+    arquivo, ficaram PARADOS no disco de quem atualizou naquela janela - um exe de
+    jogo velho que os launchers 2026-09-30.2 a .6 abririam em vez do atual.
+
+    So age se o "Tibia 2 Client.exe" existir (a pasta e mesmo do jogo) e nunca apaga
+    o exe com que este launcher foi aberto (instalacao daquela fase aberta como
+    "OTibion.exe"). Arquivo em uso (jogo aberto) so falha calado e sai na proxima."""
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        if not os.path.isfile(os.path.join(root, CLIENT_EXE)):
+            return
+        aberto = os.path.normcase(os.path.abspath(sys.executable))
+        for nome in EXES_HERANCA_OTIBION:
+            cam = os.path.join(root, nome)
+            if os.path.isfile(cam) and os.path.normcase(os.path.abspath(cam)) != aberto:
+                try:
+                    os.remove(cam)
+                    log_erro("heranca OTibion removida", None, cam)
+                except OSError:
+                    pass
+    except Exception as e:
+        log_erro("faxina heranca OTibion", e)
+
+
 def self_update():
     """Se este launcher (onedir) estiver desatualizado (version != a do servidor
     em launcher.json), baixa a PASTA nova (zip), dispara o swapper .bat e sai.
@@ -2026,6 +2490,16 @@ def self_update():
         log_erro("launcher zip corrompido", None, "crc esperado " + str(want_crc))
         _rmtree_quieto(upd)
         return False
+    # O launcher novo so entra se o release ASSINOU este zip (ver
+    # CHAVE_PUBLICA_RELEASE): sem isto, quem trocasse o zip no servidor rodaria
+    # o que quisesse na maquina de todo jogador no proximo auto-update.
+    assinada = carregar_assinatura()
+    lanc = (assinada or {}).get("launcher") or {}
+    if not assinada or lanc.get("version") != remote_ver or lanc.get("zip_sha256") != sha256_of(zpath):
+        log_erro("launcher zip sem assinatura valida", None,
+                 "versao %s; assinado %s" % (remote_ver, lanc.get("version")))
+        _rmtree_quieto(upd)
+        return False
     # Extrai para _launcher_update\new (o zip tem exe + _internal na RAIZ).
     newdir = os.path.join(upd, "new")
     try:
@@ -2036,6 +2510,20 @@ def self_update():
         log_erro("extrair launcher (zip)", e, zpath)
         _rmtree_quieto(upd)
         return False
+    # Aberto por outro nome (instalacao da fase OTibion aberta como "OTibion.exe", que
+    # o zip nao traz mais desde 01/10): sem o proprio nome no zip o launcher desistiria
+    # da atualizacao para sempre. Todos os exes do zip sao o MESMO programa, entao um
+    # deles vira a copia com o nosso nome e o atalho continua abrindo.
+    alvo_exe = os.path.join(newdir, exe_name)
+    if not os.path.isfile(alvo_exe):
+        for fonte in ("OTibion.exe", "Tibia 2.exe"):
+            if os.path.isfile(os.path.join(newdir, fonte)):
+                try:
+                    import shutil
+                    shutil.copy2(os.path.join(newdir, fonte), alvo_exe)
+                except Exception as e:
+                    log_erro("copiar exe do zip para o nome aberto", e, fonte + " -> " + exe_name)
+                break
     if not os.path.isfile(os.path.join(newdir, exe_name)) or \
        not os.path.isdir(os.path.join(newdir, "_internal")):
         log_erro("launcher zip sem exe/_internal", None, newdir)
@@ -2048,8 +2536,13 @@ def self_update():
     # Escreve o swapper (caminhos baked) e dispara destacado.
     bat = os.path.join(upd, "apply.bat")
     try:
+        # O swapper troca o exe PELO NOME com que este launcher foi aberto ("Tibia 2.exe"
+        # ou "OTibion.exe"). Era fixo "Tibia 2.exe": aberto pelo nome novo, o waitloop
+        # nem esperaria o processo certo fechar. O .bat e ASCII, entao um nome com
+        # acento (jogador renomeou o exe) cai no padrao em vez de corromper o script.
+        nome_bat = exe_name if exe_name.isascii() and '"' not in exe_name else "Tibia 2.exe"
         with open(bat, "w", encoding="ascii", errors="replace") as f:
-            f.write(_SWAPPER_BAT)
+            f.write(_SWAPPER_BAT.replace("__EXE__", nome_bat))
     except Exception as e:
         log_erro("escrever swapper", e, bat)
         _rmtree_quieto(upd)

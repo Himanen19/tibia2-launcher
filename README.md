@@ -42,17 +42,80 @@ Requer Python 3.11+ no Windows.
 
 ```bat
 pip install -r requirements.txt
-pyinstaller --onefile --noconsole --name "Tibia 2" --icon "assets/shield.ico" --add-data "assets;assets" launcher.py
+python -m PyInstaller --noconfirm --distpath dist-noupx --workpath build-noupx "Tibia 2.spec"
 ```
 
-Sai `dist/Tibia 2.exe`. O CI (`.github/workflows/build.yml`) faz o mesmo a cada
-tag `v*` e publica o `.exe` como artefato.
+Sai a pasta `dist-noupx/Tibia 2/` (`Tibia 2.exe` + `_internal/`). O build é em
+**pasta** (onedir), sem UPX: o modo de um arquivo só extrai tudo para `%TEMP%` e
+relança a si mesmo, o que antivírus costuma barrar. O instalador
+(`Tibia 2 Setup.exe`) é feito pelo Inno Setup a partir de `installer.iss`.
+
+O CI (`.github/workflows/build.yml`) faz o mesmo a cada tag `v*` e publica a
+pasta e o instalador como artefatos. **Os binários distribuídos saem só do CI**,
+nunca de uma máquina de desenvolvedor.
 
 ## Dependências
 
 - **Runtime:** [Pillow](https://python-pillow.org/) (composição da UI). O resto é
   biblioteca padrão (`tkinter`, `ctypes`, `urllib`, ...).
 - **Build:** [PyInstaller](https://pyinstaller.org/).
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by
+[SignPath Foundation](https://signpath.org/).
+
+Only the artifacts built by this repository's GitHub Actions workflow
+(`.github/workflows/build.yml`) from a tagged commit are signed: `Tibia 2.exe`
+(the launcher) and `Tibia 2 Setup.exe` (its installer). Nothing built outside
+the CI is signed, and every signing request is approved manually.
+
+### Team roles
+
+| Role | Member |
+|---|---|
+| Author / Committer | [@Himanen19](https://github.com/Himanen19) |
+| Reviewer | [@Himanen19](https://github.com/Himanen19) |
+| Approver (signing requests) | [@Himanen19](https://github.com/Himanen19) |
+
+Changes from anyone else come in as pull requests and are reviewed before merge.
+Multi-factor authentication is required for every account with write access to this repository and to SignPath.
+
+## Privacy policy
+
+The launcher never asks for, reads or sends account names, passwords, e-mail
+addresses or any file outside its own installation folder. Login happens inside
+the game client, not in the launcher.
+
+It talks only to `tibia2ot.com`, over HTTPS:
+
+- **Update check and download** — requests the file manifest and its Ed25519
+  signature, then downloads the client files that are missing or changed. This
+  is the launcher's purpose and runs on every start.
+- **Launcher content** — fetches the news panel, the featured streams/videos
+  and the online player count shown in the window.
+- **Error report** — if an update or download fails, sends one anonymous line
+  with the error message, the launcher version and the Windows version
+  (for example `Windows-11-10.0.26200`). No account, character or hardware
+  identifier is included.
+- **Click counter** — when you click a partner stream or video card, sends the
+  network and channel name of that card so partners can be credited. Nothing
+  about you is included.
+
+As with any web request, the server sees the IP address of the connection. Links
+(Discord, Instagram, YouTube, Twitch, the store) open in your default browser
+only when you click them.
+
+The launcher changes nothing in the system configuration. It writes only inside
+its own folder: the downloaded client, an integrity cache and a log file
+(`tibia2-launcher.log`).
+
+## Uninstall
+
+Use **Tibia 2** in *Settings → Apps → Installed apps* (or the *Uninstall Tibia 2*
+shortcut in the Start menu). The uninstaller removes the launcher, the downloaded
+client and the shortcuts. If you only copied the folder, deleting it removes
+everything.
 
 ## Licença
 

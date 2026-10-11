@@ -71,3 +71,8 @@ coll = COLLECT(
     upx_exclude=[],
     name='Tibia 2',
 )
+
+# A pasta sai so com "Tibia 2.exe". Os launchers ja instalados so se auto-atualizam se
+# o zip trouxer um exe com o NOME DELES - por isso este nome nunca muda. (De 29/09 a
+# 01/10 saiu tambem uma copia "OTibion.exe", heranca do rebrand revertido; o launcher
+# 2026-09-30.8 apaga a copia velha do disco.)

@@ -4,16 +4,26 @@
 ; ganha atalhos (Desktop + Menu Iniciar) e um desinstalador; na primeira execucao
 ; o launcher baixa o cliente inteiro NA PASTA DA INSTALACAO.
 ;
-; Pasta padrao: uma pasta "Tibia 2" na AREA DE TRABALHO do usuario (o jogador ve
-; e acha facil). PrivilegesRequired=lowest = sem admin, e o Desktop e gravavel,
-; entao o launcher grava os ~940 MB do cliente na propria pasta. O usuario pode
-; trocar a pasta no assistente. O UninstallDelete remove tambem o cliente baixado.
+; Pasta padrao: %LOCALAPPDATA%\Programs\Tibia 2 - onde o Windows espera programa
+; instalado por usuario, sem admin (PrivilegesRequired=lowest), e gravavel, entao o
+; launcher grava os ~940 MB do cliente na propria pasta. O jogador acha o jogo pelo
+; ATALHO da Area de Trabalho (marcado de fabrica) e pelo Menu Iniciar.
+;
+; Ate 11/10/2026 o padrao era uma pasta "Tibia 2" na propria Area de Trabalho. Um
+; executavel que baixa outros executaveis e troca a si mesmo, rodando do Desktop, e o
+; retrato que antivirus e SmartScreen fazem de um "dropper"; da pasta de programas e
+; o comportamento de um instalador comum. Quem ja instalou continua onde esta (o Inno
+; reaproveita a pasta da instalacao anterior). O usuario pode trocar a pasta no
+; assistente. O UninstallDelete remove tambem o cliente baixado.
 
 #define MyAppName "Tibia 2"
 #define MyAppVersion "1.0"
 #define MyAppPublisher "Tibia 2"
 #define MyAppURL "https://tibia2ot.com/"
 #define MyAppExeName "Tibia 2.exe"
+; Pasta que o PyInstaller gera (COLLECT name= no .spec). Fica "Tibia 2": e o
+; nome do build.
+#define BuildDir "Tibia 2"
 
 [Setup]
 AppId={{D04FCDFF-24FF-4AC1-8CE5-00C8C970F943}
@@ -22,7 +32,7 @@ AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
-DefaultDirName={autodesktop}\{#MyAppName}
+DefaultDirName={localappdata}\Programs\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
@@ -57,7 +67,18 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 ; LAUNCHER_VERSION (baked no codigo) com o "version" do launcher.json. Como a
 ; pasta instalada carrega a mesma versao que foi publicada, quem instala do zero
 ; nao ve update imediato. Ver docs/deploy-online.md.
-Source: "dist-noupx\{#MyAppName}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist-noupx\{#BuildDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[InstallDelete]
+; Rebrand OTibion (29/09) REVERTIDO em 30/09. O AppId e o MESMO, entao quem
+; reinstala por cima atualiza a instalacao existente. Quem instalou naquela fase
+; ganhou atalhos "OTibion" (-> OTibion.exe): eles saem para nao sobrar um de cada;
+; os novos voltam a "Tibia 2". As copias "OTibion.exe" (launcher) e "OTibion
+; Client.exe" (jogo) deixaram de ser publicadas em 01/10 e saem tambem.
+Type: files; Name: "{autodesktop}\OTibion.lnk"
+Type: files; Name: "{group}\OTibion.lnk"
+Type: files; Name: "{app}\OTibion.exe"
+Type: files; Name: "{app}\OTibion Client.exe"
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
