@@ -75,7 +75,7 @@ EXES_HERANCA_OTIBION = ("OTibion Client.exe", "OTibion.exe")
 # o codigo vive espalhado em _internal\ e nao mais num unico .exe com um CRC. O
 # deploy LE este valor daqui (nunca digita no JSON) - ver deploy-cliente.ps1.
 # BUMP a cada launcher que for publicado, senao o auto-update nao dispara.
-LAUNCHER_VERSION = "2026-10-10.1"
+LAUNCHER_VERSION = "2026-10-11.1"
 
 # ASSINATURA DAS ATUALIZACOES (auditoria 2026-10-01, segunda rodada; decisao do
 # dono 2026-10-03). O CRC do manifesto so prova que o arquivo chegou inteiro, nao
