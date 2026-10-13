@@ -13,7 +13,7 @@ baixa o que mudou.
 
 Installer and portable build: **[Releases](https://github.com/Himanen19/tibia2-launcher/releases/latest)**.
 Players normally get it from [tibia2ot.com/downloads](https://tibia2ot.com/downloads).
-See the [Code signing policy](#code-signing-policy) below.
+The files are not code-signed yet: see [Code signing](#code-signing) below.
 
 ## Por que um programa separado
 
@@ -66,26 +66,12 @@ nunca de uma máquina de desenvolvedor.
   biblioteca padrão (`tkinter`, `ctypes`, `urllib`, ...).
 - **Build:** [PyInstaller](https://pyinstaller.org/).
 
-## Code signing policy
+## Code signing
 
-Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by
-[SignPath Foundation](https://signpath.org/).
-
-Only the artifacts built by this repository's GitHub Actions workflow
-(`.github/workflows/build.yml`) from a tagged commit are signed: `Tibia 2.exe`
-(the launcher) and `Tibia 2 Setup.exe` (its installer). Nothing built outside
-the CI is signed, and every signing request is approved manually.
-
-### Team roles
-
-| Role | Member |
-|---|---|
-| Author / Committer | [@Himanen19](https://github.com/Himanen19) |
-| Reviewer | [@Himanen19](https://github.com/Himanen19) |
-| Approver (signing requests) | [@Himanen19](https://github.com/Himanen19) |
-
-Changes from anyone else come in as pull requests and are reviewed before merge.
-Multi-factor authentication is required for every account with write access to this repository and to SignPath.
+The releases are **not code-signed** at the moment, so Windows SmartScreen and some
+browsers may warn about the download. The executables are built from this repository
+with the steps under [Build](#build), so anyone can read the source and build the same
+program.
 
 ## Privacy policy
 
